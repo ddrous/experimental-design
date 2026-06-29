@@ -233,5 +233,5 @@ if __name__ == "__main__":
     anim_html = visualize(ts, ys)
     display(anim_html)
 
-    
+
 # %%
