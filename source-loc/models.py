@@ -169,7 +169,7 @@ def _pair_encode(x_seq: jnp.ndarray, y_seq: jnp.ndarray, encoder: eqx.nn.MLP) ->
 # ----------------------------------------------------------------------------------
 # Design policy (inverse model): pi_psi(history, belief) -> next design
 # ----------------------------------------------------------------------------------
-class DesignPolicy(eqx.Module):
+class DesignPolicyTransformer(eqx.Module):
     """Transformer design policy conditioned via AdaLN on the current belief hat_theta_t."""
     pair_encoder: eqx.nn.MLP
     null_token: jnp.ndarray
@@ -204,6 +204,32 @@ class DesignPolicy(eqx.Module):
         summary = tokens[-1]
         raw = self.out_head(summary)
         return self.design_bound * jnp.tanh(raw)
+    
+# ----------------------------------------------------------------------------------
+# Design policy MLP (inverse model): pi_psi(\cdot, belief) -> next design; it ignores the history and is a simple MLP conditioned on the belief.
+# ----------------------------------------------------------------------------------
+class DesignPolicyMLP(eqx.Module):
+    """MLP design policy conditioned on the current belief hat_theta_t. Ignores history."""
+    net: eqx.nn.MLP
+    design_dim: int = eqx.field(static=True)
+    design_bound: float = eqx.field(static=True)
+
+    def __init__(self, design_dim, obs_dim, belief_dim, hidden=64, depth=3,
+                 design_bound=4.0, *, key):
+        in_dim = 2 * belief_dim  # cond on [mu, log_sigma]
+        out_dim = design_dim
+        self.net = eqx.nn.MLP(in_dim, out_dim, hidden, depth=depth, key=key)
+        self.design_dim = design_dim
+        self.design_bound = design_bound
+
+    def __call__(self, x_hist: jnp.ndarray, y_hist: jnp.ndarray, belief: Belief) -> jnp.ndarray:
+        """x_hist/y_hist are ignored; only the belief is used to produce the next design."""
+        inp = jnp.concatenate([belief.mu, belief.log_sigma], axis=-1)
+        raw = self.net(inp)
+        # return self.design_bound * jnp.tanh(raw)
+        ## Crop the design to be within the bounds [-design_bound, design_bound]
+        return jnp.clip(raw, -self.design_bound, self.design_bound)
+
 
 
 # ----------------------------------------------------------------------------------
@@ -228,7 +254,8 @@ class BayesSimulatorMLP(eqx.Module):
         out = self.net(inp)
         d_mu, d_log_sigma = jnp.split(out, 2, axis=-1)
         new_mu = belief.mu + d_mu
-        new_log_sigma = belief.log_sigma + jnp.tanh(d_log_sigma) * 0.5  # bounded, stable update
+        # new_log_sigma = belief.log_sigma + jnp.tanh(d_log_sigma) * 0.5  # bounded, stable update
+        new_log_sigma = belief.log_sigma + d_log_sigma
         return Belief(mu=new_mu, log_sigma=new_log_sigma)
 
 

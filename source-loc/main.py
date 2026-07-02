@@ -17,7 +17,7 @@ sns.set_theme(style="whitegrid", rc={"figure.facecolor": "white", "axes.facecolo
 
 # Import our custom modules
 from models import (
-    DesignPolicy, BayesSimulatorMLP, BayesSimulatorTransformer, 
+    DesignPolicyTransformer, DesignPolicyMLP, BayesSimulatorMLP, BayesSimulatorTransformer, 
     SourceLocConfig, environment_step, init_belief, belief_entropy, sort_sources_by_amplitude, expected_information_gain
 )
 from datalloaders import SourceLocPrior, make_train_loader, make_eval_loader
@@ -29,16 +29,16 @@ from datalloaders import SourceLocPrior, make_train_loader, make_eval_loader
 # Experiment Config
 # SEED = 2026
 SEED = time.time_ns() % (2**32 - 1)  # Use current time as seed for variability
-MAX_T = 25                  # Trajectory length (number of queries per episode)
-BATCH_SIZE = 64
+MAX_T = 30                  # Trajectory length (number of queries per episode)
+BATCH_SIZE = 256
 EPOCHS = 10
-STEPS_PER_EPOCH = 150        # Virtual epoch size for infinite streaming
+STEPS_PER_EPOCH = 1000        # Virtual epoch size for infinite streaming
 LR = 1e-4
 
 # Architecture Config
 DESIGN_DIM = 2
 OBS_DIM = 1
-K_SOURCES = 1               # "Simplest version" with 1 source
+K_SOURCES = 2               # "Simplest version" with 1 source
 BELIEF_DIM = K_SOURCES * 2  # Flattened coordinates of sources
 BELIEF_MODE = "gaussian"    # "point" or "gaussian"
 SIMULATOR_TYPE = "mlp" # "mlp" or "transformer"
@@ -58,16 +58,21 @@ key = jax.random.PRNGKey(SEED)
 key, p_key, s_key = jax.random.split(key, 3)
 
 # 1. Design Policy (Inverse Model)
-policy = DesignPolicy(
+# policy = DesignPolicyTransformer(
+#     design_dim=DESIGN_DIM, obs_dim=OBS_DIM, belief_dim=BELIEF_DIM, 
+#     hidden=64, num_heads=4, num_layers=2, key=p_key
+# )
+policy = DesignPolicyMLP(
     design_dim=DESIGN_DIM, obs_dim=OBS_DIM, belief_dim=BELIEF_DIM, 
-    hidden=64, num_heads=4, num_layers=2, key=p_key
+    hidden=128, key=p_key
 )
+
 
 # 2. Bayes Simulator (Forward Model)
 if SIMULATOR_TYPE == "mlp":
     simulator = BayesSimulatorMLP(
         design_dim=DESIGN_DIM, obs_dim=OBS_DIM, belief_dim=BELIEF_DIM, 
-        hidden=64, depth=3, key=s_key
+        hidden=128, depth=3, key=s_key
     )
 else:
     simulator = BayesSimulatorTransformer(
@@ -77,7 +82,7 @@ else:
 
 # Combine for Equinox parameter updates
 class LABEDModel(eqx.Module):
-    policy: DesignPolicy
+    policy: DesignPolicyTransformer
     simulator: eqx.Module
 
 model = LABEDModel(policy=policy, simulator=simulator)
@@ -227,12 +232,28 @@ def loss_fn(model: LABEDModel, batch_theta: jnp.ndarray, batch_key: jax.random.P
 
     mus = jnp.reshape(mus, (B, MAX_T, K_SOURCES, DESIGN_DIM))  # Shape: (B, T, K, d)
     # total_mse = jnp.mean((mus[:, -1, :] - batch_theta) ** 2)
-    total_mse = jnp.mean(jnp.sum(mses * discounts, axis=1))
+    # total_mse = jnp.mean(jnp.sum(mses * discounts, axis=1))
 
     # total_mse = jnp.log(total_mse + 1e-8)  # Log-transform to stabilize training
 
     # loss = total_mse
 
+
+    ## Let's compute the minimum after premuting all K sources, and then take the minimum MSE across all permutations. This is a combinatorial problem, but for small K (like 3), it's feasible.
+    from itertools import permutations
+    perm_indices = jnp.array(list(permutations(range(K_SOURCES))))  # Shape: (K!, K)
+    num_perms = perm_indices.shape[0]
+    for perm in perm_indices:
+        # Reorder mus according to the current permutation
+        mus_perm = mus[:, -1, perm, :]  # Shape: (B, K, d)
+        mse_perm = jnp.mean((mus_perm - batch_theta.reshape(B, K_SOURCES, DESIGN_DIM)) ** 2, axis=(1, 2))  # Shape: (B,)
+        if 'min_mse' not in locals():
+            min_mse = mse_perm
+        else:
+            min_mse = jnp.minimum(min_mse, mse_perm)
+    total_mse = jnp.mean(min_mse)
+
+    total_mse += jnp.log(total_mse + 1e-8)  # Log-transform to stabilize training
 
     # # Let's use log-sigma and compute the negative log-likelihood loss for the final belief
     # batch_theta = batch_theta.reshape(B, K_SOURCES * DESIGN_DIM)  # Shape: (B, K*d)
