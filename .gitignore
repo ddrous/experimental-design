@@ -1,2 +1,5 @@
 *.pyc
 *.png
+
+source-loc/flow-matching/runs/
+source-loc/world-model/runs/
