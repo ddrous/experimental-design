@@ -77,7 +77,7 @@ class Config:
     lr_max: float = 5e-4
     lr_warmup_steps: int = 500
     gamma: float = 0.95           # Temporal discount
-    loss_matching: str = "sort"   # "sort" (recommended) | "permute"
+    loss_matching: str = "permute"   # "sort" (recommended) | "permute"
     
     # --- Design Regularisation ---
     # Options: "none", "coverage", "batch_entropy", "contrastive_llr"
@@ -88,7 +88,7 @@ class Config:
     # --- Data Regime ---
     data_mode: str = "infinite"     # "finite" | "infinite"
     n_train_episodes: int = 100_000
-    steps_per_epoch: int = 500    # Used if data_mode == "infinite"
+    steps_per_epoch: int = 5000    # Used if data_mode == "infinite"
 
     @property
     def belief_dim(self) -> int:
@@ -436,7 +436,7 @@ ax[1].set_xlabel("Step"); ax[1].set_ylabel("MSE"); ax[1].set_yscale("log"); ax[1
 fig.tight_layout()
 plt.show()
 fig.savefig(run_dir / "plots" / "training_curves.png", dpi=150)
-plt.close(fig)
+# plt.close(fig)
 
 #%%
 # --- Visualise Evaluation Trajectory ---
@@ -480,4 +480,4 @@ ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.12), ncol=4, fontsize=10)
 ax.grid(True, alpha=0.3)
 plt.show()
 fig.savefig(run_dir / "plots" / f"trajectory_eval_{idx}.png", dpi=150)
-plt.close(fig)
+# plt.close(fig)
