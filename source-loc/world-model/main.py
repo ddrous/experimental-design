@@ -88,7 +88,7 @@ class Config:
     # --- Data Regime ---
     data_mode: str = "infinite"     # "finite" | "infinite"
     n_train_episodes: int = 100_000
-    steps_per_epoch: int = 5000    # Used if data_mode == "infinite"
+    steps_per_epoch: int = 50000    # Used if data_mode == "infinite"
 
     @property
     def belief_dim(self) -> int:
@@ -481,3 +481,11 @@ ax.grid(True, alpha=0.3)
 plt.show()
 fig.savefig(run_dir / "plots" / f"trajectory_eval_{idx}.png", dpi=150)
 # plt.close(fig)
+
+
+#%%
+# # --- Save Final Model ---
+# save_model(model, run_dir / "final_model.eqx")
+
+# ## Prin the runing directory and the final model path
+# print(f"✅ Training complete. Final model saved at: {run_dir / 'final_model.eqx'}")
