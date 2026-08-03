@@ -1,0 +1,50 @@
+{
+  "batch_tasks": 64,
+  "context_dim": 64,
+  "dimension": 2,
+  "encoder_depth": 2,
+  "encoder_width": 128,
+  "epochs": 50,
+  "fusion_depth": 3,
+  "fusion_width": 192,
+  "gradient_clip": 1.0,
+  "learning_rate": 0.0003,
+  "log_every_steps": 100,
+  "loss_weights": {
+    "displacement": 0.0,
+    "rff_mmd": 0.1,
+    "supervised_map": 1.0
+  },
+  "residual_scale": 1.0,
+  "rff": {
+    "bandwidths": [
+      0.25,
+      0.5,
+      1.0,
+      2.0
+    ],
+    "features_per_bandwidth": 64
+  },
+  "samples_per_task": 64,
+  "source_mean_range": [
+    -1.5,
+    1.5
+  ],
+  "source_std_range": [
+    0.35,
+    1.25
+  ],
+  "steps_per_epoch": 100,
+  "target_mean_range": [
+    -1.5,
+    1.5
+  ],
+  "target_std_range": [
+    0.35,
+    1.25
+  ],
+  "validation_batches": 8,
+  "visualisation_samples": 800,
+  "visualisation_tasks": 4,
+  "weight_decay": 1e-06
+}

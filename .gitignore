@@ -3,3 +3,9 @@
 
 source-loc/flow-matching/runs/
 source-loc/world-model/runs/
+
+
+*eqx
+*gz
+*npz
+*npy

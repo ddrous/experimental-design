@@ -1,0 +1,64 @@
+{
+  "batch_tasks": 16,
+  "context_dim": 96,
+  "data_dir": "./data/mnist_raw",
+  "digit_classes": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ],
+  "encoder_depth": 2,
+  "epochs": 25,
+  "fusion_depth": 3,
+  "fusion_width": 256,
+  "gradient_clip": 1.0,
+  "learning_rate": 0.0002,
+  "log_every_steps": 100,
+  "loss_weights": {
+    "displacement": 0.01,
+    "moments": 1.0,
+    "rff_mmd": 10.0,
+    "sliced_w2": 1.0
+  },
+  "max_test_tasks": 1000,
+  "max_train_tasks": 10000,
+  "max_validation_tasks": 1000,
+  "pixel_mass_floor": 0.0001,
+  "point_encoder_width": 128,
+  "residual_scale": 1.0,
+  "rff": {
+    "bandwidths": [
+      0.05,
+      0.1,
+      0.2,
+      0.4,
+      0.8
+    ],
+    "features_per_bandwidth": 64
+  },
+  "samples_per_task": 128,
+  "sliced_wasserstein_projections": 32,
+  "source_encoder_width": 128,
+  "source_mean_range": [
+    -0.2,
+    0.2
+  ],
+  "source_std_range": [
+    0.35,
+    0.7
+  ],
+  "target_context_mode": "sqrt_scaled",
+  "target_encoder_width": 256,
+  "target_jitter": true,
+  "validation_batch_tasks": 16,
+  "visualisation_examples": 6,
+  "visualisation_samples": 3000,
+  "weight_decay": 1e-06
+}
