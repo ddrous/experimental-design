@@ -9,3 +9,5 @@ source-loc/world-model/runs/
 *gz
 *npz
 *npy
+
+*runs/

@@ -76,7 +76,7 @@ class BayesTransportConfig:
     seed: int = 7
 
     # Source-localisation simulator.
-    K: int = 1
+    K: int = 2
     prior_std: float = 1.0
     design_low: float = -3.0
     design_high: float = 3.0
@@ -126,7 +126,7 @@ class BayesTransportConfig:
     kinetic_weight: float = 0.0
 
     # Optimisation.
-    epochs: int = 24
+    epochs: int = 10
     learning_rate: float = 3e-4
     weight_decay: float = 1e-4
     grad_clip_norm: float = 1.0
@@ -146,9 +146,9 @@ CFG = BayesTransportConfig(
     # Set likelihood_available=False to exercise the simulator-only ABC path.
     likelihood_available=True,
     teacher_method="auto",
-    max_context_pairs=8,
+    max_context_pairs=20,
     num_particles=64,
-    epochs=24,
+    epochs=10,
     n_train_episodes=20_000,
     n_eval_episodes=512,
     batch_size=64,
@@ -225,14 +225,14 @@ class SourceLocPrior:
 def source_log_signal_np(
     theta: np.ndarray,
     x: np.ndarray,
-    cfg: BayesTransportConfig,
+    CFG: BayesTransportConfig,
 ) -> np.ndarray:
     """Return log mean intensity, broadcasting over leading theta dimensions."""
     theta = np.asarray(theta, dtype=np.float64)
     x = np.asarray(x, dtype=np.float64)
     dist_sq = np.sum((theta - np.expand_dims(x, axis=-2)) ** 2, axis=-1)
-    intensity = cfg.background + np.sum(
-        cfg.source_strength / (cfg.softening + dist_sq), axis=-1
+    intensity = CFG.background + np.sum(
+        CFG.source_strength / (CFG.softening + dist_sq), axis=-1
     )
     return np.log(intensity)
 
@@ -240,12 +240,12 @@ def source_log_signal_np(
 def source_log_signal_jax(
     theta: Array,
     x: Array,
-    cfg: BayesTransportConfig,
+    CFG: BayesTransportConfig,
 ) -> Array:
     """JAX mean of p(y | theta, x), broadcasting over leading dimensions."""
     dist_sq = jnp.sum((theta - jnp.expand_dims(x, axis=-2)) ** 2, axis=-1)
-    intensity = cfg.background + jnp.sum(
-        cfg.source_strength / (cfg.softening + dist_sq), axis=-1
+    intensity = CFG.background + jnp.sum(
+        CFG.source_strength / (CFG.softening + dist_sq), axis=-1
     )
     return jnp.log(intensity)
 
@@ -254,30 +254,30 @@ def source_log_likelihood_np(
     y: np.ndarray | float,
     theta: np.ndarray,
     x: np.ndarray,
-    cfg: BayesTransportConfig,
+    CFG: BayesTransportConfig,
 ) -> np.ndarray:
     """Evaluate log p(y | theta, x); never call this in simulator-only mode."""
-    if not cfg.likelihood_available:
+    if not CFG.likelihood_available:
         raise RuntimeError(
             "The configuration declares p(y | theta, x) unavailable. "
             "Use the ABC teacher, which needs only forward simulation."
         )
-    mean = source_log_signal_np(theta, x, cfg)
-    z = (np.asarray(y, dtype=np.float64) - mean) / cfg.observation_noise_std
-    normalizer = math.log(cfg.observation_noise_std * math.sqrt(2.0 * math.pi))
+    mean = source_log_signal_np(theta, x, CFG)
+    z = (np.asarray(y, dtype=np.float64) - mean) / CFG.observation_noise_std
+    normalizer = math.log(CFG.observation_noise_std * math.sqrt(2.0 * math.pi))
     return -0.5 * z**2 - normalizer
 
 
 def simulate_observation_np(
     theta: np.ndarray,
     x: np.ndarray,
-    cfg: BayesTransportConfig,
+    CFG: BayesTransportConfig,
     rng: np.random.Generator,
 ) -> np.ndarray:
     """Draw y ~ p(y | theta, x) without requiring likelihood evaluation."""
-    mean = source_log_signal_np(theta, x, cfg)
+    mean = source_log_signal_np(theta, x, CFG)
     return np.asarray(
-        mean + cfg.observation_noise_std * rng.normal(size=np.shape(mean)),
+        mean + CFG.observation_noise_std * rng.normal(size=np.shape(mean)),
         dtype=np.float32,
     )
 
@@ -285,12 +285,12 @@ def simulate_observation_np(
 def simulate_observation_jax(
     theta: Array,
     x: Array,
-    cfg: BayesTransportConfig,
+    CFG: BayesTransportConfig,
     key: Array,
 ) -> Array:
     """Differentiable reparameterised simulation from p(y | theta, x)."""
-    mean = source_log_signal_jax(theta, x, cfg)
-    return mean + cfg.observation_noise_std * jax.random.normal(key, mean.shape)
+    mean = source_log_signal_jax(theta, x, CFG)
+    return mean + CFG.observation_noise_std * jax.random.normal(key, mean.shape)
 
 
 def canonicalize_sources_np(theta: np.ndarray) -> np.ndarray:
@@ -333,13 +333,13 @@ def systematic_resample_np(
     return np.searchsorted(cdf, positions, side="right")
 
 
-def resolve_teacher_method(cfg: BayesTransportConfig) -> str:
-    method = cfg.teacher_method.lower()
+def resolve_teacher_method(CFG: BayesTransportConfig) -> str:
+    method = CFG.teacher_method.lower()
     if method == "auto":
-        return "snis" if cfg.likelihood_available else "abc"
+        return "snis" if CFG.likelihood_available else "abc"
     if method not in {"snis", "abc"}:
         raise ValueError("teacher_method must be one of: auto, snis, abc.")
-    if method == "snis" and not cfg.likelihood_available:
+    if method == "snis" and not CFG.likelihood_available:
         raise ValueError(
             "teacher_method='snis' requires likelihood_available=True. "
             "Choose 'abc' or 'auto' for an implicit simulator."
@@ -355,7 +355,7 @@ class TeacherPosterior(NamedTuple):
 
 def approximate_posterior_particles_np(
     prior: SourceLocPrior,
-    cfg: BayesTransportConfig,
+    CFG: BayesTransportConfig,
     rng: np.random.Generator,
     context_x: np.ndarray,
     context_y: np.ndarray,
@@ -373,46 +373,46 @@ def approximate_posterior_particles_np(
     it with SMC-ABC, neural ratio estimation, or another SBI method does not change the
     transport model's API.
     """
-    method = resolve_teacher_method(cfg)
-    proposals = prior.sample_n(rng, cfg.teacher_proposals)
+    method = resolve_teacher_method(CFG)
+    proposals = prior.sample_n(rng, CFG.teacher_proposals)
     active = np.flatnonzero(np.asarray(context_mask) > 0.5)
 
     if active.size == 0:
-        indices = rng.integers(0, cfg.teacher_proposals, size=cfg.num_particles)
+        indices = rng.integers(0, CFG.teacher_proposals, size=CFG.num_particles)
         posterior = proposals[indices]
         return TeacherPosterior(
             particles=posterior.astype(np.float32),
-            ess=np.float32(cfg.teacher_proposals),
+            ess=np.float32(CFG.teacher_proposals),
             method_code=np.int32(0 if method == "snis" else 1),
         )
 
-    log_weights = np.zeros((cfg.teacher_proposals,), dtype=np.float64)
+    log_weights = np.zeros((CFG.teacher_proposals,), dtype=np.float64)
     if method == "snis":
         for slot in active:
             log_weights += source_log_likelihood_np(
-                float(context_y[slot, 0]), proposals, context_x[slot], cfg
+                float(context_y[slot, 0]), proposals, context_x[slot], CFG
             )
     else:
         # Simulator-only ABC kernel.  Each proposal generates R pseudo-observations
         # from p(y | theta, x); no likelihood value is queried or approximated by name.
-        normalising_scale = max(cfg.observation_noise_std, 1e-6)
+        normalising_scale = max(CFG.observation_noise_std, 1e-6)
         for slot in active:
-            mean = source_log_signal_np(proposals, context_x[slot], cfg)
-            pseudo_y = mean[:, None] + cfg.observation_noise_std * rng.normal(
-                size=(cfg.teacher_proposals, cfg.abc_replicates)
+            mean = source_log_signal_np(proposals, context_x[slot], CFG)
+            pseudo_y = mean[:, None] + CFG.observation_noise_std * rng.normal(
+                size=(CFG.teacher_proposals, CFG.abc_replicates)
             )
             discrepancy_sq = np.mean(
                 ((pseudo_y - float(context_y[slot, 0])) / normalising_scale) ** 2,
                 axis=1,
             )
-            log_weights += -0.5 * discrepancy_sq / max(cfg.abc_bandwidth**2, 1e-8)
+            log_weights += -0.5 * discrepancy_sq / max(CFG.abc_bandwidth**2, 1e-8)
 
-    log_weights /= max(cfg.teacher_tempering, 1e-6)
+    log_weights /= max(CFG.teacher_tempering, 1e-6)
     log_weights -= np.max(log_weights)
     weights = np.exp(log_weights)
     weights /= np.maximum(weights.sum(), 1e-300)
     ess = np.float32(1.0 / np.sum(weights**2))
-    indices = systematic_resample_np(rng, weights, cfg.num_particles)
+    indices = systematic_resample_np(rng, weights, CFG.num_particles)
     posterior = proposals[indices].astype(np.float32)
     return TeacherPosterior(
         particles=posterior,
@@ -431,37 +431,37 @@ class BayesTransportEpisodeGenerator:
     the only indicator of which slots are active.
     """
 
-    def __init__(self, prior: SourceLocPrior, cfg: BayesTransportConfig):
+    def __init__(self, prior: SourceLocPrior, CFG: BayesTransportConfig):
         self.prior = prior
-        self.cfg = cfg
+        self.CFG = CFG
 
     def sample(self, rng: np.random.Generator) -> dict[str, np.ndarray]:
-        cfg = self.cfg
+        CFG = self.CFG
         theta_true = self.prior.sample(rng)
         context_size = int(
-            rng.integers(cfg.min_context_pairs, cfg.max_context_pairs + 1)
+            rng.integers(CFG.min_context_pairs, CFG.max_context_pairs + 1)
         )
 
         active_x = rng.uniform(
-            cfg.design_low, cfg.design_high, size=(context_size, 2)
+            CFG.design_low, CFG.design_high, size=(context_size, 2)
         ).astype(np.float32)
         active_y = np.asarray(
-            [simulate_observation_np(theta_true, x_i, cfg, rng) for x_i in active_x],
+            [simulate_observation_np(theta_true, x_i, CFG, rng) for x_i in active_x],
             dtype=np.float32,
         ).reshape(context_size, 1)
 
-        if cfg.randomise_context_order and context_size > 1:
+        if CFG.randomise_context_order and context_size > 1:
             order = rng.permutation(context_size)
             active_x = active_x[order]
             active_y = active_y[order]
 
-        context_x = np.zeros((cfg.max_context_pairs, 2), dtype=np.float32)
-        context_y = np.zeros((cfg.max_context_pairs, 1), dtype=np.float32)
-        context_mask = np.zeros((cfg.max_context_pairs,), dtype=np.float32)
+        context_x = np.zeros((CFG.max_context_pairs, 2), dtype=np.float32)
+        context_y = np.zeros((CFG.max_context_pairs, 1), dtype=np.float32)
+        context_mask = np.zeros((CFG.max_context_pairs,), dtype=np.float32)
         if context_size > 0:
-            if cfg.randomise_context_slots:
+            if CFG.randomise_context_slots:
                 slots = rng.choice(
-                    cfg.max_context_pairs, size=context_size, replace=False
+                    CFG.max_context_pairs, size=context_size, replace=False
                 )
             else:
                 slots = np.arange(context_size)
@@ -469,16 +469,16 @@ class BayesTransportEpisodeGenerator:
             context_y[slots] = active_y
             context_mask[slots] = 1.0
 
-        prior_particles = self.prior.sample_n(rng, cfg.num_particles)
+        prior_particles = self.prior.sample_n(rng, CFG.num_particles)
         teacher = approximate_posterior_particles_np(
-            self.prior, cfg, rng, context_x, context_y, context_mask
+            self.prior, CFG, rng, context_x, context_y, context_mask
         )
         target_particles = teacher.particles
 
         # Random relabelling is applied independently.  The model/loss may then
         # canonicalise each K-source sample, so no semantically meaningful source ID is
         # introduced by data generation.
-        if cfg.randomise_source_labels and cfg.K > 1:
+        if CFG.randomise_source_labels and CFG.K > 1:
             theta_true = randomise_source_labels_np(theta_true, rng)
             prior_particles = randomise_source_labels_np(prior_particles, rng)
             target_particles = randomise_source_labels_np(target_particles, rng)
@@ -557,40 +557,40 @@ def collate_dicts(batch: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
 
 def make_transport_train_loader(
     generator: BayesTransportEpisodeGenerator,
-    cfg: BayesTransportConfig,
+    CFG: BayesTransportConfig,
 ):
-    if cfg.data_mode == "finite":
-        dataset = FiniteTransportEpisodes(generator, cfg.n_train_episodes, cfg.seed)
+    if CFG.data_mode == "finite":
+        dataset = FiniteTransportEpisodes(generator, CFG.n_train_episodes, CFG.seed)
         torch_generator = torch.Generator()
-        torch_generator.manual_seed(cfg.seed)
+        torch_generator.manual_seed(CFG.seed)
         return DataLoader(
             dataset,
-            batch_size=cfg.batch_size,
+            batch_size=CFG.batch_size,
             shuffle=True,
             collate_fn=collate_dicts,
-            num_workers=cfg.num_workers,
+            num_workers=CFG.num_workers,
             generator=torch_generator,
             drop_last=True,
         )
-    if cfg.data_mode == "infinite":
-        dataset = InfiniteTransportEpisodes(generator, cfg.seed)
+    if CFG.data_mode == "infinite":
+        dataset = InfiniteTransportEpisodes(generator, CFG.seed)
         return DataLoader(
             dataset,
-            batch_size=cfg.batch_size,
+            batch_size=CFG.batch_size,
             collate_fn=collate_dicts,
-            num_workers=cfg.num_workers,
+            num_workers=CFG.num_workers,
         )
     raise ValueError("data_mode must be 'finite' or 'infinite'.")
 
 
 def make_transport_eval_loader(
     generator: BayesTransportEpisodeGenerator,
-    cfg: BayesTransportConfig,
+    CFG: BayesTransportConfig,
 ):
-    dataset = EvalTransportEpisodes(generator, cfg.n_eval_episodes, cfg.seed + 20_000)
+    dataset = EvalTransportEpisodes(generator, CFG.n_eval_episodes, CFG.seed + 20_000)
     return DataLoader(
         dataset,
-        batch_size=cfg.batch_size,
+        batch_size=CFG.batch_size,
         shuffle=False,
         collate_fn=collate_dicts,
         num_workers=0,
@@ -677,30 +677,30 @@ class ContextSetEncoder(eqx.Module):
     y_center: float = eqx.field(static=True)
     y_scale: float = eqx.field(static=True)
 
-    def __init__(self, cfg: BayesTransportConfig, *, key: Array):
+    def __init__(self, CFG: BayesTransportConfig, *, key: Array):
         pair_key, summary_key, empty_key = jax.random.split(key, 3)
-        self.design_scale = max(abs(cfg.design_low), abs(cfg.design_high), 1.0)
-        self.y_center = cfg.y_center
-        self.y_scale = cfg.y_scale
+        self.design_scale = max(abs(CFG.design_low), abs(CFG.design_high), 1.0)
+        self.y_center = CFG.y_center
+        self.y_scale = CFG.y_scale
         self.pair_encoder = eqx.nn.MLP(
             in_size=3,
-            out_size=cfg.hidden_dim,
-            width_size=cfg.hidden_dim,
-            depth=cfg.context_encoder_depth,
+            out_size=CFG.hidden_dim,
+            width_size=CFG.hidden_dim,
+            depth=CFG.context_encoder_depth,
             activation=jax.nn.silu,
             final_activation=jax.nn.silu,
             key=pair_key,
         )
         self.summary_encoder = eqx.nn.MLP(
-            in_size=2 * cfg.hidden_dim + 1,
-            out_size=cfg.hidden_dim,
-            width_size=cfg.hidden_dim,
+            in_size=2 * CFG.hidden_dim + 1,
+            out_size=CFG.hidden_dim,
+            width_size=CFG.hidden_dim,
             depth=2,
             activation=jax.nn.silu,
             final_activation=jax.nn.silu,
             key=summary_key,
         )
-        self.empty_context = 0.02 * jax.random.normal(empty_key, (cfg.hidden_dim,))
+        self.empty_context = 0.02 * jax.random.normal(empty_key, (CFG.hidden_dim,))
 
     def __call__(
         self,
@@ -745,26 +745,26 @@ class BayesPushforwardTransformer(eqx.Module):
     max_displacement: float = eqx.field(static=True)
     canonicalize: bool = eqx.field(static=True)
 
-    def __init__(self, cfg: BayesTransportConfig, *, key: Array):
-        self.K = cfg.K
-        self.theta_dim = 2 * cfg.K
-        self.max_displacement = cfg.max_particle_displacement
-        self.canonicalize = cfg.canonicalize_particle_sources
+    def __init__(self, CFG: BayesTransportConfig, *, key: Array):
+        self.K = CFG.K
+        self.theta_dim = 2 * CFG.K
+        self.max_displacement = CFG.max_particle_displacement
+        self.canonicalize = CFG.canonicalize_particle_sources
 
-        keys = jax.random.split(key, cfg.depth + 4)
-        self.particle_in = eqx.nn.Linear(self.theta_dim, cfg.hidden_dim, key=keys[0])
-        self.context_encoder = ContextSetEncoder(cfg, key=keys[1])
+        keys = jax.random.split(key, CFG.depth + 4)
+        self.particle_in = eqx.nn.Linear(self.theta_dim, CFG.hidden_dim, key=keys[0])
+        self.context_encoder = ContextSetEncoder(CFG, key=keys[1])
         self.blocks = tuple(
             AdaLNZeroBlock(
-                cfg.hidden_dim,
-                cfg.heads,
-                cfg.mlp_ratio * cfg.hidden_dim,
+                CFG.hidden_dim,
+                CFG.heads,
+                CFG.mlp_ratio * CFG.hidden_dim,
                 key=keys[2 + i],
             )
-            for i in range(cfg.depth)
+            for i in range(CFG.depth)
         )
-        self.final_norm = eqx.nn.LayerNorm(cfg.hidden_dim)
-        output = eqx.nn.Linear(cfg.hidden_dim, self.theta_dim, key=keys[-1])
+        self.final_norm = eqx.nn.LayerNorm(CFG.hidden_dim)
+        output = eqx.nn.Linear(CFG.hidden_dim, self.theta_dim, key=keys[-1])
 
         # Identity initialization is natural for a pushforward: before training,
         # empty-context inputs remain prior samples and non-empty contexts initially
@@ -809,21 +809,21 @@ def save_transport_model(path: str | Path, model: BayesPushforwardTransformer):
 
 def load_transport_model(
     path: str | Path,
-    cfg: BayesTransportConfig,
+    CFG: BayesTransportConfig,
     *,
     key: Array | None = None,
 ) -> BayesPushforwardTransformer:
     if key is None:
         key = jax.random.key(0)
-    skeleton = BayesPushforwardTransformer(cfg, key=key)
+    skeleton = BayesPushforwardTransformer(CFG, key=key)
     return eqx.tree_deserialise_leaves(Path(path), skeleton)
 
 
 #%% 7) Sliced-Wasserstein objective and sample diagnostics
-def flatten_particle_measure(particles: Array, cfg: BayesTransportConfig) -> Array:
-    if cfg.canonicalize_particle_sources and cfg.K > 1:
+def flatten_particle_measure(particles: Array, CFG: BayesTransportConfig) -> Array:
+    if CFG.canonicalize_particle_sources and CFG.K > 1:
         particles = canonicalize_sources_jax(particles)
-    return particles.reshape(particles.shape[0], 2 * cfg.K)
+    return particles.reshape(particles.shape[0], 2 * CFG.K)
 
 
 def random_unit_directions(key: Array, n_directions: int, dimension: int) -> Array:
@@ -837,11 +837,11 @@ def sliced_wasserstein_squared(
     predicted_particles: Array,
     target_particles: Array,
     directions: Array,
-    cfg: BayesTransportConfig,
+    CFG: BayesTransportConfig,
 ) -> Array:
     """Monte-Carlo sliced W_2^2 between two equally weighted particle measures."""
-    predicted = flatten_particle_measure(predicted_particles, cfg)
-    target = flatten_particle_measure(target_particles, cfg)
+    predicted = flatten_particle_measure(predicted_particles, CFG)
+    target = flatten_particle_measure(target_particles, CFG)
     predicted_projection = predicted @ directions.T
     target_projection = target @ directions.T
     predicted_sorted = jnp.sort(predicted_projection, axis=0)
@@ -860,17 +860,17 @@ def transport_kinetic_energy(
 def sample_mean_rmse(
     particles: Array,
     theta_true: Array,
-    cfg: BayesTransportConfig,
+    CFG: BayesTransportConfig,
 ) -> Array:
-    particles_flat = flatten_particle_measure(particles, cfg)
+    particles_flat = flatten_particle_measure(particles, CFG)
     theta = theta_true
-    if cfg.canonicalize_particle_sources and cfg.K > 1:
+    if CFG.canonicalize_particle_sources and CFG.K > 1:
         theta = canonicalize_sources_jax(theta)
     return jnp.sqrt(jnp.mean((jnp.mean(particles_flat, axis=0) - theta.reshape(-1)) ** 2))
 
 
-def sample_spread(particles: Array, cfg: BayesTransportConfig) -> Array:
-    flat = flatten_particle_measure(particles, cfg)
+def sample_spread(particles: Array, CFG: BayesTransportConfig) -> Array:
+    flat = flatten_particle_measure(particles, CFG)
     return jnp.mean(jnp.var(flat, axis=0))
 
 
@@ -883,7 +883,7 @@ def _active_context(episode: dict[str, np.ndarray]):
 def plot_transport_episode(
     model: BayesPushforwardTransformer,
     episode: dict[str, np.ndarray],
-    cfg: BayesTransportConfig,
+    CFG: BayesTransportConfig,
     destination: Path,
     title_prefix: str,
 ):
@@ -913,7 +913,7 @@ def plot_transport_episode(
         point_sets.append(context_x.reshape(-1, 2))
     all_points = np.concatenate(point_sets, axis=0)
     lim = max(
-        3.0 * cfg.prior_std,
+        3.0 * CFG.prior_std,
         1.15 * float(np.quantile(np.abs(all_points), 0.995)),
     )
 
@@ -976,43 +976,58 @@ def plot_transport_episode(
         )
         fig.colorbar(scatter, ax=pair_ax, label="observed outcome y")
     pair_ax.scatter(theta_true[:, 0], theta_true[:, 1], marker="*", s=190, label="theta")
-    pair_ax.set_xlim(cfg.design_low, cfg.design_high)
-    pair_ax.set_ylim(cfg.design_low, cfg.design_high)
+    pair_ax.set_xlim(CFG.design_low, CFG.design_high)
+    pair_ax.set_ylim(CFG.design_low, CFG.design_high)
     pair_ax.set_aspect("equal")
     pair_ax.grid(alpha=0.2)
     pair_ax.set_title("Unordered conditioning set D = {(x_i, y_i)}")
     pair_ax.legend(fontsize=8)
 
     likelihood_ax = axes[1, 2]
-    if cfg.K == 1 and cfg.likelihood_available and context_x.size:
-        # This panel is intentionally called a likelihood panel.  It visualises
-        # p(y_j | theta, x_j), not p(theta | D).
-        x_j = context_x[0]
-        y_j = float(context_y[0])
-        grid = np.linspace(-lim, lim, cfg.grid_size)
-        gx, gy = np.meshgrid(grid, grid)
-        theta_grid = np.stack([gx, gy], axis=-1)[:, :, None, :]
-        log_likelihood = source_log_likelihood_np(y_j, theta_grid, x_j, cfg)
-        likelihood = np.exp(log_likelihood - np.max(log_likelihood))
-        contour = likelihood_ax.contourf(gx, gy, likelihood, levels=30)
-        fig.colorbar(contour, ax=likelihood_ax, label="relative likelihood")
-        likelihood_ax.scatter(x_j[0], x_j[1], marker="x", s=90, label="design x_j")
+    # if CFG.K >= 1:
+    # Physically intuitive panel: expected sensor reading E[y | theta, x] as a
+    # function of design location x, given the true source theta. This is the
+    # forward model itself (not a likelihood-over-theta slice), so it directly
+    # shows the "closer to theta -> higher reading" intuition and lets us check
+    # observed (x_i, y_i) context points against the field they were drawn from.
+    grid = np.linspace(CFG.design_low, CFG.design_high, CFG.grid_size)
+    gx, gy = np.meshgrid(grid, grid)
+    x_grid = np.stack([gx, gy], axis=-1)
+    field = source_log_signal_np(theta_true, x_grid, CFG)  # log E[y | theta, x]
+
+    vmin = min(field.min(), context_y.min()) if context_x.size else field.min()
+    vmax = max(field.max(), context_y.max()) if context_x.size else field.max()
+
+    contour = likelihood_ax.contourf(
+        gx, gy, field, levels=30, cmap="magma", vmin=vmin, vmax=vmax
+    )
+    fig.colorbar(contour, ax=likelihood_ax, label="expected log outcome  log E[y | theta, x]")
+
+    if context_x.size:
         likelihood_ax.scatter(
-            theta_true[0, 0], theta_true[0, 1], marker="*", s=190, label="theta"
+            context_x[:, 0], context_x[:, 1],
+            c=context_y, cmap="magma", vmin=vmin, vmax=vmax,
+            s=110, marker="s", edgecolors="white", linewidths=1.2,
+            label="observed (x_i, y_i) in D",
         )
-        likelihood_ax.set_title("Likelihood p(y_j | theta, x_j)")
-        likelihood_ax.legend(fontsize=8)
-    else:
-        likelihood_ax.axis("off")
-        mode = (
-            "K > 1: a 2K-dimensional likelihood cannot be shown on one plane."
-            if cfg.K > 1
-            else "Simulator-only mode: p(y | theta, x) is not evaluated."
-        )
-        likelihood_ax.text(
-            0.5, 0.5, mode, ha="center", va="center", wrap=True,
-            transform=likelihood_ax.transAxes,
-        )
+    likelihood_ax.scatter(
+        theta_true[:, 0], theta_true[:, 1], marker="*", s=220,
+        color="white", edgecolors="black", linewidths=0.8, label="theta",
+    )
+    likelihood_ax.set_xlim(CFG.design_low, CFG.design_high)
+    likelihood_ax.set_ylim(CFG.design_low, CFG.design_high)
+    likelihood_ax.set_aspect("equal")
+    likelihood_ax.set_title("Sensor field around the true source")
+    likelihood_ax.legend(fontsize=8, loc="upper right")
+    # else:
+    #     likelihood_ax.axis("off")
+    #     likelihood_ax.text(
+    #         0.5, 0.5,
+    #         "K > 1: the sensor field is a superposition of K sources and\n"
+    #         "is no longer a simple function of a single theta.",
+    #         ha="center", va="center", wrap=True,
+    #         transform=likelihood_ax.transAxes,
+    #     )
 
     teacher_name = "SNIS" if int(episode["teacher_method_code"][0]) == 0 else "ABC"
     fig.suptitle(
@@ -1026,45 +1041,48 @@ def plot_transport_episode(
 
 
 #%% 9) Training entry point
-def main(cfg: BayesTransportConfig = CFG):
-    np.random.seed(cfg.seed)
-    print("JAX devices:", jax.devices())
-    print("Resolved approximate-Bayes teacher:", resolve_teacher_method(cfg))
 
-    run_dir = make_run_dir(cfg.env_name, cfg.runs_base)
+
+if __name__ == "__main__":
+
+    np.random.seed(CFG.seed)
+    print("JAX devices:", jax.devices())
+    print("Resolved approximate-Bayes teacher:", resolve_teacher_method(CFG))
+
+    run_dir = make_run_dir(CFG.env_name, CFG.runs_base)
     script_path = Path(globals().get("__file__", "stage_1_train_bayes_pushforward.py")).resolve()
     snapshot_files(run_dir, [script_path])
     save_config_yaml(
-        cfg,
+        CFG,
         run_dir / "config.yaml",
         extra={
             "training_complete": False,
-            "resolved_teacher_method": resolve_teacher_method(cfg),
+            "resolved_teacher_method": resolve_teacher_method(CFG),
             "stage": 1,
         },
     )
     print("Stage-I run directory:", run_dir)
-    print("Configuration:\n", yaml.safe_dump(asdict(cfg), sort_keys=False))
+    print("Configuration:\n", yaml.safe_dump(asdict(CFG), sort_keys=False))
 
-    prior = SourceLocPrior(K=cfg.K, prior_std=cfg.prior_std)
-    generator = BayesTransportEpisodeGenerator(prior, cfg)
-    train_loader = make_transport_train_loader(generator, cfg)
-    eval_loader = make_transport_eval_loader(generator, cfg)
+    prior = SourceLocPrior(K=CFG.K, prior_std=CFG.prior_std)
+    generator = BayesTransportEpisodeGenerator(prior, CFG)
+    train_loader = make_transport_train_loader(generator, CFG)
+    eval_loader = make_transport_eval_loader(generator, CFG)
     steps_per_epoch = (
-        len(train_loader) if cfg.data_mode == "finite" else cfg.steps_per_epoch
+        len(train_loader) if CFG.data_mode == "finite" else CFG.steps_per_epoch
     )
     fixed_episode = eval_loader.dataset[0]
     np.savez_compressed(run_dir / "artefacts" / "fixed_episode.npz", **fixed_episode)
 
-    model_key = jax.random.key(cfg.seed)
-    model = BayesPushforwardTransformer(cfg, key=model_key)
+    model_key = jax.random.key(CFG.seed)
+    model = BayesPushforwardTransformer(CFG, key=model_key)
     # eqx.tree_pprint(model)
 
     optimizer = optax.chain(
-        optax.clip_by_global_norm(cfg.grad_clip_norm),
+        optax.clip_by_global_norm(CFG.grad_clip_norm),
         optax.adamw(
-            learning_rate=cfg.learning_rate,
-            weight_decay=cfg.weight_decay,
+            learning_rate=CFG.learning_rate,
+            weight_decay=CFG.weight_decay,
         ),
     )
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
@@ -1076,7 +1094,7 @@ def main(cfg: BayesTransportConfig = CFG):
     ):
         direction_key = jax.random.fold_in(key, 17)
         directions = random_unit_directions(
-            direction_key, cfg.num_swd_projections, 2 * cfg.K
+            direction_key, CFG.num_swd_projections, 2 * CFG.K
         )
         predicted = jax.vmap(candidate_model)(
             batch["prior_particles"],
@@ -1086,26 +1104,26 @@ def main(cfg: BayesTransportConfig = CFG):
         )
         swd = jax.vmap(
             lambda prediction, target: sliced_wasserstein_squared(
-                prediction, target, directions, cfg
+                prediction, target, directions, CFG
             )
         )(predicted, batch["target_particles"])
         kinetic = jax.vmap(transport_kinetic_energy)(
             batch["prior_particles"], predicted
         )
         mean_rmse = jax.vmap(
-            lambda particles, theta: sample_mean_rmse(particles, theta, cfg)
+            lambda particles, theta: sample_mean_rmse(particles, theta, CFG)
         )(predicted, batch["theta_true"])
         target_rmse = jax.vmap(
-            lambda particles, theta: sample_mean_rmse(particles, theta, cfg)
+            lambda particles, theta: sample_mean_rmse(particles, theta, CFG)
         )(batch["target_particles"], batch["theta_true"])
-        predicted_spread = jax.vmap(lambda p: sample_spread(p, cfg))(predicted)
-        target_spread = jax.vmap(lambda p: sample_spread(p, cfg))(
+        predicted_spread = jax.vmap(lambda p: sample_spread(p, CFG))(predicted)
+        target_spread = jax.vmap(lambda p: sample_spread(p, CFG))(
             batch["target_particles"]
         )
 
         # At most two terms.  With the default kinetic_weight=0 this is exactly the
         # single sample-matching objective requested by the user.
-        loss = jnp.mean(swd) + cfg.kinetic_weight * jnp.mean(kinetic)
+        loss = jnp.mean(swd) + CFG.kinetic_weight * jnp.mean(kinetic)
         metrics = {
             "loss": loss,
             "sliced_wasserstein_sq": jnp.mean(swd),
@@ -1147,14 +1165,16 @@ def main(cfg: BayesTransportConfig = CFG):
                 collected.setdefault(name, []).append(float(value))
         return {name: float(np.mean(values)) for name, values in collected.items()}
 
+
+
     plot_transport_episode(
         model,
         fixed_episode,
-        cfg,
+        CFG,
         run_dir / "plots" / "fixed_episode_before_training.png",
         "Stage I before training",
     )
-    initial_metrics = evaluate(model, eval_loader, cfg.seed + 100_000)
+    initial_metrics = evaluate(model, eval_loader, CFG.seed + 100_000)
     print("Initial validation metrics:", initial_metrics)
 
     history: dict[str, list[float]] = {
@@ -1171,7 +1191,7 @@ def main(cfg: BayesTransportConfig = CFG):
     }
     visualisation_epochs = sorted(
         set(
-            int(math.ceil(fraction * cfg.epochs / 10.0))
+            int(math.ceil(fraction * CFG.epochs / 10.0))
             for fraction in range(1, 11)
         )
     )
@@ -1179,20 +1199,20 @@ def main(cfg: BayesTransportConfig = CFG):
     best_epoch = 0
     global_step = 0
     training_started_at = time.time()
-    train_key = jax.random.key(cfg.seed + 1)
+    train_key = jax.random.key(CFG.seed + 1)
 
-    for epoch in range(1, cfg.epochs + 1):
+    for epoch in range(1, CFG.epochs + 1):
         epoch_started_at = time.time()
         train_losses_this_epoch: list[float] = []
         epoch_iterator = (
             iter(train_loader)
-            if cfg.data_mode == "finite"
-            else islice(iter(train_loader), cfg.steps_per_epoch)
+            if CFG.data_mode == "finite"
+            else islice(iter(train_loader), CFG.steps_per_epoch)
         )
         progress = tqdm(
             enumerate(epoch_iterator, start=1),
             total=steps_per_epoch,
-            desc=f"Bayes transport epoch {epoch:03d}/{cfg.epochs:03d}",
+            desc=f"Bayes transport epoch {epoch:03d}/{CFG.epochs:03d}",
             dynamic_ncols=True,
             leave=True,
         )
@@ -1218,7 +1238,7 @@ def main(cfg: BayesTransportConfig = CFG):
             )
 
         epoch_train_loss = float(np.mean(train_losses_this_epoch))
-        val_metrics = evaluate(model, eval_loader, cfg.seed + 100_000)
+        val_metrics = evaluate(model, eval_loader, CFG.seed + 100_000)
         history["epoch_train_loss"].append(epoch_train_loss)
         history["epoch_val_loss"].append(val_metrics["loss"])
         history["epoch_val_swd"].append(val_metrics["sliced_wasserstein_sq"])
@@ -1233,9 +1253,9 @@ def main(cfg: BayesTransportConfig = CFG):
         save_transport_model(run_dir / "artefacts" / "model_last.eqx", model)
         eqx.tree_serialise_leaves(
             run_dir / "artefacts" / "training_state_last.eqx",
-            (model, opt_state, train_key),
+            (model, opt_state, jax.random.key_data(train_key)),
         )
-        if epoch % cfg.save_every_epochs == 0:
+        if epoch % CFG.save_every_epochs == 0:
             save_transport_model(
                 run_dir / "artefacts" / f"model_epoch_{epoch:04d}.eqx", model
             )
@@ -1256,7 +1276,7 @@ def main(cfg: BayesTransportConfig = CFG):
                 "best_epoch": best_epoch,
                 "best_val_loss": best_val_loss,
                 "elapsed_seconds": time.time() - training_started_at,
-                "resolved_teacher_method": resolve_teacher_method(cfg),
+                "resolved_teacher_method": resolve_teacher_method(CFG),
             },
         )
 
@@ -1274,54 +1294,97 @@ def main(cfg: BayesTransportConfig = CFG):
             plot_transport_episode(
                 model,
                 fixed_episode,
-                cfg,
+                CFG,
                 run_dir / "plots" / f"fixed_episode_epoch_{epoch:04d}.png",
                 f"Stage I after epoch {epoch}",
             )
 
     best_model = load_transport_model(
-        run_dir / "artefacts" / "model_best.eqx", cfg, key=jax.random.key(0)
+        run_dir / "artefacts" / "model_best.eqx", CFG, key=jax.random.key(0)
     )
-    final_metrics = evaluate(best_model, eval_loader, cfg.seed + 100_000)
+    final_metrics = evaluate(best_model, eval_loader, CFG.seed + 100_000)
     plot_transport_episode(
         best_model,
         fixed_episode,
-        cfg,
+        CFG,
         run_dir / "plots" / "fixed_episode_best_model.png",
         f"Stage I best model (epoch {best_epoch})",
     )
 
+    #%%
+    #%% Unified training diagnostics: per-step metrics (top) + per-epoch curves (bottom)
+
+    steps = np.arange(1, len(history["step_loss"]) + 1)
     epochs = np.arange(1, len(history["epoch_train_loss"]) + 1)
-    fig, ax = plt.subplots(figsize=(8.0, 5.2), constrained_layout=True)
-    ax.plot(epochs, history["epoch_train_loss"], label="training objective")
-    ax.plot(epochs, history["epoch_val_loss"], label="validation objective")
-    ax.plot(epochs, history["epoch_val_swd"], label="validation sliced W2 squared")
-    ax.set_xlabel("epoch")
-    ax.set_ylabel("sample-matching loss")
-    ax.set_title("Stage-I Bayesian pushforward training")
-    ax.grid(alpha=0.25)
-    ax.legend()
-    fig.savefig(run_dir / "plots" / "training_curves.png", dpi=170)
+
+    plt.style.use("default")
+    fig = plt.figure(figsize=(11.0, 10.0), constrained_layout=True)
+    fig.suptitle("Stage-I Bayesian pushforward — training diagnostics", fontsize=14, fontweight="bold")
+
+    # Top block: 2x2 grid of per-step metrics
+    top_gs = fig.add_gridspec(3, 1, height_ratios=[2.0, 2.0, 2.6])
+    step_gs = top_gs[0:2].subgridspec(2, 2, hspace=0.35, wspace=0.28)
+
+    step_panels = [
+        ("step_loss", "sample-matching loss", "#1f77b4"),
+        ("step_swd", "sliced $W_2^2$", "#d62728"),
+        ("step_kinetic", "kinetic energy", "#2ca02c"),
+        ("step_grad_norm", "gradient norm", "#9467bd"),
+    ]
+
+    for gs_cell, (key, ylabel, color) in zip(step_gs, step_panels):
+        ax = fig.add_subplot(gs_cell)
+        values = np.asarray(history[key])
+        ax.plot(steps, values, color=color, linewidth=0.8, alpha=0.85)
+        if len(values) >= 20:
+            window = max(5, len(values) // 100)
+            smoothed = np.convolve(values, np.ones(window) / window, mode="valid")
+            ax.plot(
+                steps[window - 1:], smoothed,
+                color=color, linewidth=1.8, alpha=1.0,
+                label=f"moving avg ({window})",
+            )
+            ax.legend(fontsize=7, loc="upper right", frameon=False)
+        ax.set_title(ylabel, fontsize=10, fontweight="bold", loc="left")
+        ax.set_xlabel("step", fontsize=8)
+        ax.tick_params(labelsize=8)
+        ax.grid(alpha=0.2)
+        ax.spines[["top", "right"]].set_visible(False)
+
+    # Bottom block: per-epoch train/val loss + SWD
+    ax_bottom = fig.add_subplot(top_gs[2])
+    ax_bottom.plot(epochs, history["epoch_train_loss"], marker="o", markersize=3,
+                color="#1f77b4", label="train loss")
+    ax_bottom.plot(epochs, history["epoch_val_loss"], marker="o", markersize=3,
+                color="#ff7f0e", label="val loss")
+    ax_bottom.axvline(best_epoch, color="grey", linestyle="--", linewidth=1.0, alpha=0.7,
+                    label=f"best epoch ({best_epoch})")
+    ax_bottom.set_xlabel("epoch", fontsize=10)
+    ax_bottom.set_ylabel("sample-matching loss", fontsize=10)
+    ax_bottom.set_title("Per-epoch train / validation objective", fontsize=10, fontweight="bold", loc="left")
+    ax_bottom.grid(alpha=0.25)
+    ax_bottom.spines[["top", "right"]].set_visible(False)
+    ax_bottom.tick_params(labelsize=9)
+
+    ax_bottom2 = ax_bottom.twinx()
+    ax_bottom2.plot(epochs, history["epoch_val_swd"], marker="s", markersize=3,
+                    color="#2ca02c", linestyle=":", label="val sliced $W_2^2$")
+    ax_bottom2.set_ylabel("validation sliced $W_2^2$", fontsize=10, color="#2ca02c")
+    ax_bottom2.tick_params(axis="y", labelcolor="#2ca02c", labelsize=9)
+    ax_bottom2.spines[["top"]].set_visible(False)
+
+    lines1, labels1 = ax_bottom.get_legend_handles_labels()
+    lines2, labels2 = ax_bottom2.get_legend_handles_labels()
+    ax_bottom.legend(lines1 + lines2, labels1 + labels2, fontsize=8, loc="upper right", frameon=False)
+
+    plt.tight_layout()
+
+    fig.savefig(run_dir / "plots" / "training_diagnostics.png", dpi=170)
     display(fig)
     plt.close(fig)
 
-    save_config_yaml(
-        cfg,
-        run_dir / "config.yaml",
-        extra={
-            "training_complete": True,
-            "stage": 1,
-            "resolved_teacher_method": resolve_teacher_method(cfg),
-            "best_epoch": best_epoch,
-            "best_val_loss": best_val_loss,
-            "final_validation_metrics": final_metrics,
-        },
-    )
     print("Best epoch:", best_epoch)
     print("Final validation metrics:", final_metrics)
     print("Saved Stage-I artefacts under:", run_dir)
-    return run_dir
 
 
-if __name__ == "__main__":
-    main()

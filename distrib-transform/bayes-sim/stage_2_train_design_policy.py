@@ -14,9 +14,11 @@ Two policy-training variants are provided in this single file.
 
 ``simple_energy_score``
     Roll out the policy through the differentiable simulator and frozen transport,
-    then minimise one terminal energy-score term for the sample approximation to
-    p(theta | D_T).  The energy score is proper for sample distributions and does not
-    require evaluating q_phi(theta | D_T) or p(y | theta, x).
+    then minimise an energy-score objective for the sample approximation to
+    p(theta | D_t). The energy score is proper for sample distributions and does not
+    require evaluating q_phi(theta | D_T) or p(y | theta, x). By default this loss is
+    summed over every step's posterior along the rollout, not just the terminal one
+    (see CHANGE markers below).
 
 ``self_distilled_eig``
     At a random posterior state, generate a candidate design set.  The frozen
@@ -26,9 +28,11 @@ Two policy-training variants are provided in this single file.
     toward it with one mean-squared-error objective.  No ground-truth theta is used in
     the teacher target once the current context has been generated.
 
-The default ``objective_mode='both'`` trains and saves both variants in separate run
-directories.  At deployment, either policy sees only approximate posterior particles
-and the current step fraction.
+``objective_mode`` selects which variant(s) to train. The default is now
+``simple_energy_score`` (see CHANGE marker in POLICY_CFG below); set it to
+``self_distilled_eig`` or ``both`` to restore the other behaviours. At deployment,
+either policy sees only approximate posterior particles and (optionally) the current
+step fraction.
 """
 from __future__ import annotations
 
@@ -53,6 +57,10 @@ import jax.numpy as jnp
 import equinox as eqx
 import optax
 
+## JAX stop at NaN
+# jax.config.update("jax_debug_nans", True)
+
+
 import stage_1_train_bayes_pushforward as s1
 from stage_1_train_bayes_pushforward import (
     Array,
@@ -69,6 +77,7 @@ from stage_1_train_bayes_pushforward import (
     simulate_observation_jax,
     snapshot_files,
     source_log_likelihood_np,
+    source_log_signal_np,  # CHANGE: needed for the new sensor-field rollout panel
     source_log_signal_jax,
 )
 
@@ -103,6 +112,11 @@ class PolicyConfig:
     heads: int = 4
     mlp_ratio: int = 4
 
+    # CHANGE (reversible): step-fraction conditioning is now config-controlled.
+    # True reproduces the original behaviour (the policy always sees t). Set to
+    # False to train a policy that ignores the step index entirely.
+    condition_on_step: bool = True
+
     # Self-distilled candidate teacher.  Candidate utilities use only posterior
     # particles and forward simulation, not an evaluable likelihood.
     teacher_candidates: int = 16
@@ -129,10 +143,13 @@ class PolicyConfig:
 
 POLICY_CFG = PolicyConfig(
     inference_run_dir=None,
-    objective_mode="both",
-    horizon=6,
+    # CHANGE (reversible): default objective is now the (step-summed) energy-score
+    # policy instead of "both". Set back to "both" or "self_distilled_eig" to
+    # restore the earlier default.
+    objective_mode="simple_energy_score",
+    horizon=10,
     num_prior_particles=64,
-    epochs=30,
+    epochs=1,
     n_train_episodes=20_000,
     n_eval_episodes=256,
     batch_size=64,
@@ -276,6 +293,11 @@ class DesignPolicyTransformer(eqx.Module):
     design_low: float = eqx.field(static=True)
     design_high: float = eqx.field(static=True)
     canonicalize: bool = eqx.field(static=True)
+    # CHANGE (reversible): step conditioning is now a static config flag rather than
+    # unconditional. The step_encoder weights still exist (so checkpoints stay
+    # shape-compatible whichever way the flag is set) but are simply unused when
+    # condition_on_step=False.
+    condition_on_step: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -289,6 +311,7 @@ class DesignPolicyTransformer(eqx.Module):
         self.design_low = transport_cfg.design_low
         self.design_high = transport_cfg.design_high
         self.canonicalize = transport_cfg.canonicalize_particle_sources
+        self.condition_on_step = policy_cfg.condition_on_step  # CHANGE
 
         keys = jax.random.split(key, policy_cfg.depth + 4)
         self.particle_in = eqx.nn.Linear(
@@ -327,7 +350,12 @@ class DesignPolicyTransformer(eqx.Module):
             posterior_particles.shape[0], self.theta_dim
         )
         tokens = _linear_tokens(self.particle_in, tokens)
-        tokens = tokens + self.step_encoder(jnp.asarray([step_fraction]))[None, :]
+        # CHANGE (reversible): step-fraction conditioning is now gated by
+        # self.condition_on_step (set from policy_cfg.condition_on_step). The
+        # original code unconditionally added this term:
+        #     tokens = tokens + self.step_encoder(jnp.asarray([step_fraction]))[None, :]
+        if self.condition_on_step:
+            tokens = tokens + self.step_encoder(jnp.asarray([step_fraction]))[None, :]
         for block in self.blocks:
             tokens = block(tokens)
         tokens = _layernorm_tokens(self.final_norm, tokens)
@@ -390,9 +418,16 @@ def energy_score_single(
     samples = flatten_measure(posterior_particles, transport_cfg)
     target = flatten_theta(theta_true, transport_cfg)
     truth_distance = jnp.mean(jnp.linalg.norm(samples - target[None, :], axis=-1))
-    pairwise_distance = jnp.mean(
-        jnp.linalg.norm(samples[:, None, :] - samples[None, :, :], axis=-1)
-    )
+    # pairwise_distance = jnp.mean(
+    #     jnp.linalg.norm(samples[:, None, :] - samples[None, :, :], axis=-1)
+    # )
+
+    diff = samples[:, None, :] - samples[None, :, :]
+    sq_dist = jnp.sum(diff ** 2, axis=-1)
+    n = samples.shape[0]
+    mask = 1.0 - jnp.eye(n)
+    pairwise_distance = jnp.sum(jnp.sqrt(sq_dist + 1e-12) * mask) / jnp.sum(mask)
+
     return truth_distance - 0.5 * pairwise_distance
 
 
@@ -430,7 +465,15 @@ def simple_energy_score_objective(
     transport_cfg: BayesTransportConfig,
     policy_cfg: PolicyConfig,
 ):
-    """End-to-end terminal energy-score objective for a batch of true parameters."""
+    """Energy-score objective for a batch of true parameters, summed over steps.
+
+    CHANGE (reversible): the loss is now the mean-over-batch of the *sum over every
+    rollout step* of the per-step energy score, instead of only the terminal step's
+    energy score. Set SUM_LOSS_OVER_STEPS=False below to restore the original
+    terminal-only objective (`loss = jnp.mean(terminal_energy)`).
+    """
+    SUM_LOSS_OVER_STEPS = True  # CHANGE (reversible): toggle to restore old behaviour
+
     batch_size = theta_true.shape[0]
     key, prior_key = jax.random.split(key)
     base_particles = transport_cfg.prior_std * jax.random.normal(
@@ -455,6 +498,9 @@ def simple_energy_score_objective(
         base_particles, context_x, context_y, context_mask
     )
     designs = []
+    # CHANGE: collect the per-step energy score instead of only keeping it for the
+    # final step.
+    step_energy_scores = []
 
     for step in range(policy_cfg.horizon):
         step_fraction = jnp.asarray(
@@ -487,11 +533,17 @@ def simple_energy_score_objective(
         )
         designs.append(design)
 
-    energy = jax.vmap(
-        lambda particles, theta: energy_score_single(
-            particles, theta, transport_cfg
-        )
-    )(posterior, theta_true)
+        # CHANGE: score this step's posterior and stash it for the (optional) sum.
+        step_energy = jax.vmap(
+            lambda particles, theta: energy_score_single(
+                particles, theta, transport_cfg
+            )
+        )(posterior, theta_true)
+        step_energy_scores.append(step_energy)
+
+    stacked_step_energy = jnp.stack(step_energy_scores, axis=0)  # [horizon, batch]
+    terminal_energy = stacked_step_energy[-1]
+
     logdet = jax.vmap(
         lambda particles: posterior_logdet_single(
             particles, transport_cfg, policy_cfg.posterior_logdet_jitter
@@ -503,11 +555,19 @@ def simple_energy_score_objective(
         )
     )(posterior, theta_true)
 
-    # Exactly one policy objective term.
-    loss = jnp.mean(energy)
+    if SUM_LOSS_OVER_STEPS:
+        # CHANGE: sum the energy score across all horizon steps (per sample), then
+        # average over the batch.
+        summed_energy_per_sample = jnp.sum(stacked_step_energy, axis=0)
+        loss = jnp.mean(summed_energy_per_sample)
+    else:
+        # Original terminal-only objective, kept for easy reversion.
+        loss = jnp.mean(terminal_energy)
+
     metrics = {
         "loss": loss,
-        "terminal_energy_score": jnp.mean(energy),
+        "terminal_energy_score": jnp.mean(terminal_energy),
+        "mean_step_energy_score": jnp.mean(stacked_step_energy),  # CHANGE: new diagnostic
         "terminal_logdet": jnp.mean(logdet),
         "terminal_mean_rmse": jnp.mean(rmse),
         "distillation_mse": jnp.asarray(0.0),
@@ -779,6 +839,7 @@ def plot_policy_rollout(
     policy_cfg: PolicyConfig,
     destination: Path,
     title_prefix: str,
+    max_displayed_stages: int = 8,  # CHANGE: cap panel columns instead of scaling fonts/sizes down
 ):
     theta_true = trajectory["theta_true"]
     all_points = [theta_true.reshape(-1, 2), trajectory["designs"].reshape(-1, 2)]
@@ -789,25 +850,36 @@ def plot_policy_rollout(
         1.15 * float(np.quantile(np.abs(shared), 0.995)),
     )
 
+    # CHANGE: pick at most `max_displayed_stages` stages out of [0, horizon], always
+    # including stage 0 and the final stage, evenly spaced in between. This replaces
+    # the previous approach of squeezing every single stage into the figure.
+    n_total_stages = policy_cfg.horizon + 1
+    n_display = min(max_displayed_stages, n_total_stages)
+    displayed_stages = sorted(
+        set(int(round(i)) for i in np.linspace(0, n_total_stages - 1, n_display))
+    )
+    n_cols = len(displayed_stages)
+
     fig, axes = plt.subplots(
         2,
-        policy_cfg.horizon + 1,
-        figsize=(3.25 * (policy_cfg.horizon + 1), 6.8),
+        n_cols,
+        figsize=(3.1 * n_cols, 7.0),
         squeeze=False,
         constrained_layout=True,
     )
-    for stage in range(policy_cfg.horizon + 1):
-        posterior_ax = axes[0, stage]
+
+    for col, stage in enumerate(displayed_stages):
+        posterior_ax = axes[0, col]
         posterior = trajectory["posteriors"][stage]
         posterior_ax.scatter(
             posterior[..., 0].reshape(-1),
             posterior[..., 1].reshape(-1),
-            s=11,
+            s=13,
             alpha=0.30,
             label=f"samples for p(theta | D_{stage})",
         )
         posterior_ax.scatter(
-            theta_true[:, 0], theta_true[:, 1], marker="*", s=165,
+            theta_true[:, 0], theta_true[:, 1], marker="*", s=170,
             label="simulator parameter theta",
         )
         if stage > 0:
@@ -822,76 +894,126 @@ def plot_policy_rollout(
         posterior_ax.set_ylim(-lim, lim)
         posterior_ax.set_aspect("equal")
         posterior_ax.grid(alpha=0.2)
-        posterior_ax.set_title(f"Approximate posterior p(theta | D_{stage})")
-        if stage in {0, policy_cfg.horizon}:
-            posterior_ax.legend(fontsize=7)
+        posterior_ax.set_title(f"$p(\\theta \\mid D_{{{stage}}})$", fontsize=11)
+        if col in {0, n_cols - 1}:
+            posterior_ax.legend(fontsize=7, loc="upper right")
 
-        likelihood_ax = axes[1, stage]
+        field_ax = axes[1, col]
         if stage == 0:
-            likelihood_ax.axis("off")
-            likelihood_ax.text(
-                0.5,
-                0.5,
-                "No observation yet\nD_0 = empty set",
-                ha="center",
-                va="center",
-                transform=likelihood_ax.transAxes,
+            field_ax.axis("off")
+            field_ax.text(
+                0.5, 0.5, "No observations yet\n$D_0$ = empty set",
+                ha="center", va="center", fontsize=9,
+                transform=field_ax.transAxes,
             )
-        elif transport_cfg.K == 1 and transport_cfg.likelihood_available:
-            design = trajectory["designs"][stage - 1]
-            observation = trajectory["observations"][stage - 1]
+        else:
             grid = np.linspace(-lim, lim, transport_cfg.grid_size)
             gx, gy = np.meshgrid(grid, grid)
-            theta_grid = np.stack([gx, gy], axis=-1)[:, :, None, :]
-            log_likelihood = source_log_likelihood_np(
-                observation, theta_grid, design, transport_cfg
+            x_grid = np.stack([gx, gy], axis=-1)
+            field = source_log_signal_np(theta_true, x_grid, transport_cfg)
+
+            history_designs = trajectory["designs"][:stage]
+            history_obs = trajectory["observations"][:stage]
+            vmin = min(field.min(), history_obs.min())
+            vmax = max(field.max(), history_obs.max())
+
+            contour = field_ax.contourf(
+                gx, gy, field, levels=26, cmap="magma", vmin=vmin, vmax=vmax
             )
-            relative_likelihood = np.exp(log_likelihood - np.max(log_likelihood))
-            contour = likelihood_ax.contourf(
-                gx, gy, relative_likelihood, levels=28
+            field_ax.scatter(
+                history_designs[:, 0], history_designs[:, 1],
+                c=history_obs, cmap="magma", vmin=vmin, vmax=vmax,
+                s=85, marker="s", edgecolors="white", linewidths=1.0,
+                label="observed (x_i, y_i)",
             )
-            likelihood_ax.scatter(
-                design[0], design[1], marker="x", s=80, label=f"design x_{stage}"
+            field_ax.scatter(
+                theta_true[:, 0], theta_true[:, 1], marker="*", s=170,
+                color="white", edgecolors="black", linewidths=0.7, label="theta",
             )
-            likelihood_ax.scatter(
-                theta_true[0, 0], theta_true[0, 1], marker="*", s=165,
-                label="theta",
-            )
-            likelihood_ax.set_xlim(-lim, lim)
-            likelihood_ax.set_ylim(-lim, lim)
-            likelihood_ax.set_aspect("equal")
-            likelihood_ax.set_title(
-                f"Likelihood p(y_{stage} | theta, x_{stage})"
-            )
-            if stage == policy_cfg.horizon:
-                fig.colorbar(contour, ax=likelihood_ax, shrink=0.75)
-                likelihood_ax.legend(fontsize=7)
-        else:
-            likelihood_ax.axis("off")
-            likelihood_ax.text(
-                0.5,
-                0.5,
-                "p(y | theta, x) not plotted\n(simulator-only mode or K > 1)",
-                ha="center",
-                va="center",
-                transform=likelihood_ax.transAxes,
-            )
+            field_ax.set_xlim(-lim, lim)
+            field_ax.set_ylim(-lim, lim)
+            field_ax.set_aspect("equal")
+            field_ax.set_title(f"Sensor field, $t={stage}$", fontsize=11)
+            if col == n_cols - 1:
+                fig.colorbar(
+                    contour, ax=field_ax, shrink=0.75,
+                    label="log E[y | theta, x]",
+                )
+                field_ax.legend(fontsize=7, loc="upper right")
 
     fig.suptitle(title_prefix, fontsize=14)
-    fig.savefig(destination, dpi=165)
+    fig.savefig(destination, dpi=170)
     display(fig)
     plt.close(fig)
 
+    # Full-resolution metrics line plot below is unaffected by the subsampling above.
     steps = np.arange(policy_cfg.horizon + 1)
-    fig, ax = plt.subplots(figsize=(8.2, 5.0), constrained_layout=True)
-    ax.plot(steps, trajectory["energy_scores"], marker="o", label="posterior energy score")
-    ax.plot(steps, trajectory["logdets"], marker="s", label="posterior log-volume proxy")
-    ax.set_xlabel("number of acquired design--outcome pairs |D_t|")
-    ax.set_title("Sample-based quality of p(theta | D_t) along the policy rollout")
-    ax.grid(alpha=0.25)
-    ax.legend()
+    energy = trajectory["energy_scores"]
+    logdet = trajectory["logdets"]
+
+    fig, ax_energy = plt.subplots(figsize=(8.6, 5.2), constrained_layout=True)
+    ax_logdet = ax_energy.twinx()
+
+    color_energy = "#1f77b4"
+    color_logdet = "#d62728"
+
+    ax_energy.plot(
+        steps, energy, marker="o", markersize=6, linewidth=2.2,
+        color=color_energy, markerfacecolor="white", markeredgewidth=1.8,
+        label="posterior energy score",
+    )
+    ax_logdet.plot(
+        steps, logdet, marker="s", markersize=6, linewidth=2.2,
+        color=color_logdet, markerfacecolor="white", markeredgewidth=1.8,
+        linestyle="--",
+        label="posterior log-volume proxy",
+    )
+
+    for ax, values, color in ((ax_energy, energy, color_energy), (ax_logdet, logdet, color_logdet)):
+        ax.scatter([steps[0], steps[-1]], [values[0], values[-1]],
+                   s=70, color=color, zorder=5, edgecolor="white", linewidth=1.2)
+    ax_energy.annotate(
+        f"{energy[0]:.2f} → {energy[-1]:.2f}",
+        xy=(steps[-1], energy[-1]), xytext=(6, 8), textcoords="offset points",
+        fontsize=9, color=color_energy, fontweight="bold",
+    )
+    ax_logdet.annotate(
+        f"{logdet[0]:.2f} → {logdet[-1]:.2f}",
+        xy=(steps[-1], logdet[-1]), xytext=(6, -14), textcoords="offset points",
+        fontsize=9, color=color_logdet, fontweight="bold",
+    )
+
+    ax_energy.set_xlabel("number of acquired design–outcome pairs  $|D_t|$", fontsize=10.5)
+    ax_energy.set_ylabel("posterior energy score", fontsize=10.5, color=color_energy)
+    ax_logdet.set_ylabel("posterior log-volume proxy", fontsize=10.5, color=color_logdet)
+    ax_energy.tick_params(axis="y", labelcolor=color_energy)
+    ax_logdet.tick_params(axis="y", labelcolor=color_logdet)
+    if policy_cfg.horizon <= 20:
+        ax_energy.set_xticks(steps)
+
+    ax_energy.set_title(
+        "Posterior contraction along the policy rollout",
+        fontsize=13, fontweight="bold", loc="left", pad=12,
+    )
+    ax_energy.text(
+        0.0, 1.02,
+        r"lower is tighter/closer to $\theta$  ·  $p(\theta \mid D_t)$",
+        transform=ax_energy.transAxes, fontsize=9, color="#666666", style="italic",
+    )
+
+    ax_energy.grid(alpha=0.2)
+    ax_energy.spines[["top"]].set_visible(False)
+    ax_logdet.spines[["top"]].set_visible(False)
+
+    lines1, labels1 = ax_energy.get_legend_handles_labels()
+    lines2, labels2 = ax_logdet.get_legend_handles_labels()
+    ax_energy.legend(
+        lines1 + lines2, labels1 + labels2,
+        loc="upper right", fontsize=9, frameon=True, framealpha=0.9,
+    )
+
     metrics_path = destination.with_name(destination.stem + "_metrics.png")
-    fig.savefig(metrics_path, dpi=165)
+    fig.savefig(metrics_path, dpi=170)
     display(fig)
     plt.close(fig)
 
@@ -950,7 +1072,8 @@ def train_variant(
 
     policy_key = jax.random.key(cfg.seed)
     policy = DesignPolicyTransformer(transport_cfg, cfg, key=policy_key)
-    eqx.tree_pprint(policy)
+    # eqx.tree_pprint(policy)
+
     optimizer = optax.chain(
         optax.clip_by_global_norm(cfg.grad_clip_norm),
         optax.adamw(
@@ -1141,7 +1264,7 @@ def train_variant(
         save_policy_model(run_dir / "artefacts" / "model_last.eqx", policy)
         eqx.tree_serialise_leaves(
             run_dir / "artefacts" / "training_state_last.eqx",
-            (policy, opt_state, train_key),
+            (policy, opt_state, jax.random.key_data(train_key))
         )
         if epoch % cfg.save_every_epochs == 0:
             save_policy_model(
@@ -1195,8 +1318,10 @@ def train_variant(
                 f"{cfg.objective_mode}: fixed rollout after epoch {epoch}",
             )
 
+    # model_to_load = "model_best.eqx" if best_epoch > 0 else "model_last.eqx"
+
     best_policy = load_policy_model(
-        run_dir / "artefacts" / "model_best.eqx",
+        run_dir / "artefacts" / "model_last.eqx",
         transport_cfg,
         cfg,
         key=jax.random.key(0),
@@ -1219,18 +1344,81 @@ def train_variant(
     )
 
     epochs = np.arange(1, len(history["epoch_train_loss"]) + 1)
-    fig, ax = plt.subplots(figsize=(8.2, 5.2), constrained_layout=True)
-    ax.plot(epochs, history["epoch_train_loss"], label="training objective")
-    ax.plot(epochs, history["epoch_val_objective"], label="validation objective")
-    ax.plot(
-        epochs,
-        history["epoch_val_rollout_energy"],
-        label="validation terminal energy score",
+    # CHANGE: replaced the single flat line plot with a unified diagnostics figure
+    # matching the Stage-I style — per-step metrics on top, per-epoch curves below.
+    steps = np.arange(1, len(history["step_loss"]) + 1)
+    epochs = np.arange(1, len(history["epoch_train_loss"]) + 1)
+
+    fig = plt.figure(figsize=(11.0, 10.0), constrained_layout=True)
+    fig.suptitle(
+        f"Stage-II policy training — {cfg.objective_mode}",
+        fontsize=14, fontweight="bold",
     )
-    ax.set_xlabel("epoch")
-    ax.set_title(f"Stage-II training: {cfg.objective_mode}")
-    ax.grid(alpha=0.25)
-    ax.legend()
+
+    top_gs = fig.add_gridspec(3, 1, height_ratios=[2.0, 2.0, 2.6])
+    step_gs = top_gs[0:2].subgridspec(2, 2, hspace=0.35, wspace=0.28)
+
+    # For self_distilled_eig, step_energy/step_teacher_gain carry the meaningful
+    # signal; for simple_energy_score, step_energy/step_grad_norm do. Both are always
+    # populated (zeros for the inactive objective's fields), so the same four panels
+    # work for either variant.
+    step_panels = [
+        ("step_loss", "training loss", "#1f77b4"),
+        ("step_energy", "terminal energy score", "#d62728"),
+        ("step_distillation", "distillation MSE", "#2ca02c"),
+        ("step_grad_norm", "gradient norm", "#9467bd"),
+    ]
+
+    for gs_cell, (key, ylabel, color) in zip(step_gs, step_panels):
+        ax = fig.add_subplot(gs_cell)
+        values = np.asarray(history[key])
+        ax.plot(steps, values, color=color, linewidth=0.8, alpha=0.85)
+        if len(values) >= 20:
+            window = max(5, len(values) // 100)
+            smoothed = np.convolve(values, np.ones(window) / window, mode="valid")
+            ax.plot(
+                steps[window - 1:], smoothed,
+                color=color, linewidth=1.8, alpha=1.0,
+                label=f"moving avg ({window})",
+            )
+            ax.legend(fontsize=7, loc="upper right", frameon=False)
+        ax.set_title(ylabel, fontsize=10, fontweight="bold", loc="left")
+        ax.set_xlabel("step", fontsize=8)
+        ax.tick_params(labelsize=8)
+        ax.grid(alpha=0.2)
+        ax.spines[["top", "right"]].set_visible(False)
+
+    # Bottom block: per-epoch train/val objective + validation rollout energy score
+    ax_bottom = fig.add_subplot(top_gs[2])
+    # ax_bottom.set_y_scale("log")
+    ax_bottom.plot(epochs, history["epoch_train_loss"], marker="o", markersize=3,
+                   color="#1f77b4", label="train objective")
+    ax_bottom.plot(epochs, history["epoch_val_objective"], marker="o", markersize=3,
+                   color="#ff7f0e", label="val objective")
+    ax_bottom.set_xlabel("epoch", fontsize=10)
+    ax_bottom.set_ylabel("objective", fontsize=10)
+    ax_bottom.set_title(
+        "Per-epoch train / validation objective", fontsize=10, fontweight="bold", loc="left"
+    )
+    ax_bottom.grid(alpha=0.25)
+    ax_bottom.spines[["top", "right"]].set_visible(False)
+    ax_bottom.tick_params(labelsize=9)
+
+    ax_bottom2 = ax_bottom.twinx()
+    ax_bottom2.plot(
+        epochs, history["epoch_val_rollout_energy"], marker="s", markersize=3,
+        color="#2ca02c", linestyle=":", label="val rollout terminal energy score",
+    )
+    ax_bottom2.set_ylabel("validation rollout terminal energy score", fontsize=10, color="#2ca02c")
+    ax_bottom2.tick_params(axis="y", labelcolor="#2ca02c", labelsize=9)
+    ax_bottom2.spines[["top"]].set_visible(False)
+
+    lines1, labels1 = ax_bottom.get_legend_handles_labels()
+    lines2, labels2 = ax_bottom2.get_legend_handles_labels()
+    ax_bottom.legend(lines1 + lines2, labels1 + labels2, fontsize=8, loc="upper right", frameon=False)
+
+    plt.tight_layout()
+
     fig.savefig(run_dir / "plots" / "training_curves.png", dpi=170)
     display(fig)
     plt.close(fig)
@@ -1256,81 +1444,184 @@ def train_variant(
 
 
 #%% 9) Top-level driver: resolve Stage I and train one or both variants
-def main(policy_cfg: PolicyConfig = POLICY_CFG):
-    print("JAX devices:", jax.devices())
-    if policy_cfg.inference_run_dir is None:
-        inference_run_dir = find_latest_run(
-            policy_cfg.runs_base, policy_cfg.inference_env_name
-        )
-    else:
-        inference_run_dir = Path(policy_cfg.inference_run_dir).expanduser().resolve()
-
-    with (inference_run_dir / "config.yaml").open("r", encoding="utf-8") as handle:
-        inference_config_payload = yaml.safe_load(handle)
-    transport_cfg = dataclass_from_dict(
-        BayesTransportConfig, inference_config_payload
+print("JAX devices:", jax.devices())
+if POLICY_CFG.inference_run_dir is None:
+    inference_run_dir = find_latest_run(
+        POLICY_CFG.runs_base, POLICY_CFG.inference_env_name
     )
-    inference_checkpoint = (
-        inference_run_dir
-        / "artefacts"
-        / policy_cfg.inference_checkpoint_name
+else:
+    inference_run_dir = Path(POLICY_CFG.inference_run_dir).expanduser().resolve()
+
+with (inference_run_dir / "config.yaml").open("r", encoding="utf-8") as handle:
+    inference_config_payload = yaml.safe_load(handle)
+transport_cfg = dataclass_from_dict(
+    BayesTransportConfig, inference_config_payload
+)
+inference_checkpoint = (
+    inference_run_dir
+    / "artefacts"
+    / POLICY_CFG.inference_checkpoint_name
+)
+if not inference_checkpoint.is_file():
+    raise FileNotFoundError(f"Missing Stage-I checkpoint: {inference_checkpoint}")
+if POLICY_CFG.horizon > transport_cfg.max_context_pairs:
+    raise ValueError(
+        "Policy horizon exceeds the Stage-I context capacity: "
+        f"horizon={POLICY_CFG.horizon} > "
+        f"max_context_pairs={transport_cfg.max_context_pairs}."
     )
-    if not inference_checkpoint.is_file():
-        raise FileNotFoundError(f"Missing Stage-I checkpoint: {inference_checkpoint}")
-    if policy_cfg.horizon > transport_cfg.max_context_pairs:
-        raise ValueError(
-            "Policy horizon exceeds the Stage-I context capacity: "
-            f"horizon={policy_cfg.horizon} > "
-            f"max_context_pairs={transport_cfg.max_context_pairs}."
-        )
-    if policy_cfg.num_prior_particles != transport_cfg.num_particles:
-        print(
-            "WARNING: the particle-set architecture accepts variable N, but Stage I "
-            "was trained with",
-            transport_cfg.num_particles,
-            "particles and Stage II requests",
-            policy_cfg.num_prior_particles,
-            ". Matching them is recommended.",
-        )
-
-    frozen_transport = load_transport_model(
-        inference_checkpoint, transport_cfg, key=jax.random.key(0)
+if POLICY_CFG.num_prior_particles != transport_cfg.num_particles:
+    print(
+        "WARNING: the particle-set architecture accepts variable N, but Stage I "
+        "was trained with",
+        transport_cfg.num_particles,
+        "particles and Stage II requests",
+        POLICY_CFG.num_prior_particles,
+        ". Matching them is recommended.",
     )
-    print("Frozen Stage-I run:", inference_run_dir)
-    print("Transport configuration:\n", yaml.safe_dump(asdict(transport_cfg), sort_keys=False))
 
-    mode = policy_cfg.objective_mode.lower()
-    if mode == "both":
-        variants = ["simple_energy_score", "self_distilled_eig"]
-    elif mode in {"simple_energy_score", "self_distilled_eig"}:
-        variants = [mode]
-    else:
-        raise ValueError(
-            "objective_mode must be one of: both, simple_energy_score, "
-            "self_distilled_eig."
+frozen_transport = load_transport_model(
+    inference_checkpoint, transport_cfg, key=jax.random.key(0)
+)
+print("Frozen Stage-I run:", inference_run_dir)
+print("Transport configuration:\n", yaml.safe_dump(asdict(transport_cfg), sort_keys=False))
+
+mode = POLICY_CFG.objective_mode.lower()
+if mode == "both":
+    variants = ["simple_energy_score", "self_distilled_eig"]
+elif mode in {"simple_energy_score", "self_distilled_eig"}:
+    variants = [mode]
+else:
+    raise ValueError(
+        "objective_mode must be one of: both, simple_energy_score, "
+        "self_distilled_eig."
+    )
+
+run_dirs = []
+for variant_index, variant in enumerate(variants):
+    variant_cfg = replace(
+        POLICY_CFG,
+        objective_mode=variant,
+        seed=POLICY_CFG.seed + 10_000 * variant_index,
+    )
+    run_dirs.append(
+        train_variant(
+            variant_cfg,
+            transport_cfg,
+            frozen_transport,
+            inference_run_dir,
+            inference_checkpoint,
         )
+    )
+print("Completed Stage-II runs:")
+for run_dir in run_dirs:
+    print(" -", run_dir)
 
-    run_dirs = []
-    for variant_index, variant in enumerate(variants):
-        variant_cfg = replace(
-            policy_cfg,
-            objective_mode=variant,
-            seed=policy_cfg.seed + 10_000 * variant_index,
+
+
+
+#%% 10) Concentration animation: watch posterior samples collapse onto theta
+# CHANGE: new cell. Renders how the approximate posterior p(theta | D_t) particles
+# gradually concentrate around the true theta as the policy acquires more
+# design-outcome pairs, and saves the result as a GIF via matplotlib's PillowWriter.
+import matplotlib.animation as mpl_animation
+from IPython.display import Image
+
+
+def make_concentration_gif(
+    trajectory: dict[str, np.ndarray],
+    transport_cfg: BayesTransportConfig,
+    destination: Path,
+    title_prefix: str,
+    fps: int = 2,
+):
+    """Animate p(theta | D_t) particles concentrating on theta as t grows."""
+    theta_true = trajectory["theta_true"]
+    posteriors = trajectory["posteriors"]
+    all_points = np.concatenate(
+        [p.reshape(-1, 2) for p in posteriors] + [theta_true.reshape(-1, 2)], axis=0
+    )
+    lim = max(
+        3.0 * transport_cfg.prior_std,
+        1.15 * float(np.quantile(np.abs(all_points), 0.995)),
+    )
+
+    fig, ax = plt.subplots(figsize=(6.0, 6.0), constrained_layout=True)
+    scatter = ax.scatter([], [], s=20, alpha=0.4, color="#1f77b4", label="posterior samples")
+    ax.scatter(
+        theta_true[:, 0], theta_true[:, 1], marker="*", s=220,
+        color="#d62728", label="theta (truth)", zorder=5,
+    )
+    if trajectory["designs"].size:
+        ax.plot(
+            trajectory["designs"][:, 0], trajectory["designs"][:, 1],
+            color="grey", marker="x", linewidth=1.0, alpha=0.5,
+            label="design history", zorder=2,
         )
-        run_dirs.append(
-            train_variant(
-                variant_cfg,
-                transport_cfg,
-                frozen_transport,
-                inference_run_dir,
-                inference_checkpoint,
-            )
-        )
-    print("Completed Stage-II runs:")
-    for run_dir in run_dirs:
-        print(" -", run_dir)
-    return run_dirs
+    ax.set_xlim(-lim, lim)
+    ax.set_ylim(-lim, lim)
+    ax.set_aspect("equal")
+    ax.grid(alpha=0.2)
+    ax.legend(fontsize=8, loc="upper right")
+    title = ax.set_title(f"{title_prefix} | t=0  (|D_t|=0)")
+
+    def update(frame_index: int):
+        particles = posteriors[frame_index].reshape(-1, 2)
+        scatter.set_offsets(particles)
+        title.set_text(f"{title_prefix} | t={frame_index}  (|D_t|={frame_index})")
+        return scatter, title
+
+    anim = mpl_animation.FuncAnimation(
+        fig, update, frames=len(posteriors), interval=600, blit=False,
+    )
+    anim.save(destination, writer=mpl_animation.PillowWriter(fps=fps))
+    plt.close(fig)
+    print("Saved concentration animation to:", destination)
 
 
-if __name__ == "__main__":
-    main()
+# Reload the best checkpoint from the first Stage-II run just trained and animate its
+# fixed-theta rollout. Assumes `run_dirs` exists from the `main()` cell above.
+if "run_dirs" in globals() and run_dirs:
+    animation_run_dir = run_dirs[0]
+
+    with (animation_run_dir / "config.yaml").open("r", encoding="utf-8") as handle:
+        animation_cfg_payload = yaml.safe_load(handle)
+    animation_policy_cfg = dataclass_from_dict(PolicyConfig, animation_cfg_payload)
+
+    inference_run_dir_for_anim = Path(animation_cfg_payload["inference_run_dir_resolved"])
+    with (inference_run_dir_for_anim / "config.yaml").open("r", encoding="utf-8") as handle:
+        transport_cfg_payload = yaml.safe_load(handle)
+    animation_transport_cfg = dataclass_from_dict(BayesTransportConfig, transport_cfg_payload)
+
+    animation_frozen_transport = load_transport_model(
+        animation_run_dir / "artefacts" / "frozen_bayes_transport.eqx",
+        animation_transport_cfg,
+        key=jax.random.key(0),
+    )
+    animation_policy = load_policy_model(
+        animation_run_dir / "artefacts" / "model_best.eqx",
+        animation_transport_cfg,
+        animation_policy_cfg,
+        key=jax.random.key(0),
+    )
+    fixed_theta_for_anim = np.load(animation_run_dir / "artefacts" / "fixed_theta.npy")
+
+    animation_trajectory = rollout_single(
+        animation_policy,
+        fixed_theta_for_anim,
+        animation_policy_cfg.seed + 700_000,
+        animation_frozen_transport,
+        animation_transport_cfg,
+        replace(animation_policy_cfg, design_exploration_std=0.0),
+    )
+    make_concentration_gif(
+        animation_trajectory,
+        animation_transport_cfg,
+        animation_run_dir / "plots" / "posterior_concentration.gif",
+        f"{animation_policy_cfg.objective_mode}: posterior concentration",
+    )
+
+    ## Display the gif here
+    gif_path = animation_run_dir / "plots" / "posterior_concentration.gif"
+    if gif_path.is_file():
+        display(Image(filename=str(gif_path))) 
