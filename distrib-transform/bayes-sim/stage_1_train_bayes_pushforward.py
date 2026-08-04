@@ -76,7 +76,7 @@ class BayesTransportConfig:
     seed: int = 7
 
     # Source-localisation simulator.
-    K: int = 2
+    K: int = 1
     prior_std: float = 1.0
     design_low: float = -3.0
     design_high: float = 3.0
@@ -96,7 +96,7 @@ class BayesTransportConfig:
     abc_replicates: int = 2
 
     # Prior and approximate-posterior particle sets.
-    num_particles: int = 64
+    num_particles: int = 128
     min_context_pairs: int = 0
     max_context_pairs: int = 8
     randomise_context_slots: bool = True
@@ -127,9 +127,9 @@ class BayesTransportConfig:
 
     # Optimisation.
     epochs: int = 10
-    learning_rate: float = 3e-4
+    learning_rate: float = 1e-4
     weight_decay: float = 1e-4
-    grad_clip_norm: float = 1.0
+    grad_clip_norm: float = 10.0
 
     # Conditioning normalisation.
     y_center: float = 0.0
@@ -147,8 +147,8 @@ CFG = BayesTransportConfig(
     likelihood_available=True,
     teacher_method="auto",
     max_context_pairs=20,
-    num_particles=64,
-    epochs=10,
+    num_particles=256,
+    epochs=20,
     n_train_episodes=20_000,
     n_eval_episodes=512,
     batch_size=64,
