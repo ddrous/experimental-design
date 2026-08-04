@@ -10,25 +10,29 @@ refresh starts from Z and the complete context D_t; the code does *not* recursiv
 transport B_{t-1}.  This avoids compounding a one-step approximation and matches the
 non-sequential Stage-I training distribution.
 
-Three policy-training variants are provided in this single file.
+Two policy-training variants are provided in this single file.
 
-``reinforce_truth_distance``
-    Train a Gaussian design policy with REINFORCE.  The one-step reward is the
-    reduction in the truth-distance term of the Stage-I energy score.
+``simple_energy_score``
+    Roll out the policy through the differentiable simulator and frozen transport,
+    then minimise an energy-score objective for the sample approximation to
+    p(theta | D_t). The energy score is proper for sample distributions and does not
+    require evaluating q_phi(theta | D_T) or p(y | theta, x). By default this loss is
+    summed over every step's posterior along the rollout, not just the terminal one
+    (see CHANGE markers below).
 
-``reinforce_concentration``
-    Train the same Gaussian design policy with REINFORCE, changing only the one-step
-    reward to the reduction in the pairwise particle-distance term.  This rewards
-    posterior concentration.
+``self_distilled_eig``
+    At a random posterior state, generate a candidate design set.  The frozen
+    approximate Bayes operator evaluates each candidate by simulator-only posterior
+    contraction under theta~ ~ T_phi(Z,D_t) and y~p(y | theta~,x).  A soft best-design
+    target is formed from the estimated information gains and the policy is distilled
+    toward it with one mean-squared-error objective.  No ground-truth theta is used in
+    the teacher target once the current context has been generated.
 
-``reparameterized_truth_distance``
-    Use the same truth-distance reward, but sample the Gaussian design through the
-    reparameterisation path and differentiate through the simulator and frozen Bayes
-    transport instead of using the score-function estimator.
-
-``objective_mode`` selects which variant(s) to train.  ``all`` trains all three in
-separate run directories.  At deployment, every policy sees only approximate
-posterior particles and (optionally) the current step fraction.
+``objective_mode`` selects which variant(s) to train. The default is now
+``simple_energy_score`` (see CHANGE marker in POLICY_CFG below); set it to
+``self_distilled_eig`` or ``both`` to restore the other behaviours. At deployment,
+either policy sees only approximate posterior particles and (optionally) the current
+step fraction.
 """
 from __future__ import annotations
 
@@ -93,15 +97,14 @@ class PolicyConfig:
     runs_base: str = "./runs"
     runs_base_policy: str = "./runs"
 
-    # ``all`` trains the three requested implementations in separate run directories.
-    objective_mode: str = "all"  # all, reinforce_truth_distance, reinforce_concentration, reparameterized_truth_distance
+    # ``both`` trains the two requested implementations in separate run directories.
+    objective_mode: str = "both"  # both, simple_energy_score, self_distilled_eig
 
     # Sequential experiment budget.  horizon must not exceed the Stage-I maximum
     # context size because D_t is passed to T_phi as one padded unordered set.
     horizon: int = 6
     num_prior_particles: int = 64
     design_exploration_std: float = 0.05
-    discount_factor: float = 0.95
 
     # Policy architecture.
     hidden_dim: int = 128
@@ -140,12 +143,13 @@ class PolicyConfig:
 
 POLICY_CFG = PolicyConfig(
     inference_run_dir=None,
-    # CHANGE (reversible): train all three policy-gradient estimators by default.
-    # Set this to one concrete mode to train only that implementation.
-    objective_mode="reinforce_concentration",
-    horizon=10,
+    # CHANGE (reversible): default objective is now the (step-summed) energy-score
+    # policy instead of "both". Set back to "both" or "self_distilled_eig" to
+    # restore the earlier default.
+    objective_mode="simple_energy_score",  
+    horizon=16,
     num_prior_particles=64,
-    epochs=50,
+    epochs=100,
     n_train_episodes=20_000,
     n_eval_episodes=256,
     batch_size=64,
@@ -398,27 +402,6 @@ def flatten_theta(theta: Array, transport_cfg: BayesTransportConfig) -> Array:
     return theta.reshape(2 * transport_cfg.K)
 
 
-def energy_score_terms_single(
-    posterior_particles: Array,
-    theta_true: Array,
-    transport_cfg: BayesTransportConfig,
-) -> tuple[Array, Array]:
-    """Return the two sample terms used by the Stage-I proper energy score."""
-    samples = flatten_measure(posterior_particles, transport_cfg)
-    target = flatten_theta(theta_true, transport_cfg)
-    truth_distance = jnp.mean(jnp.linalg.norm(samples - target[None, :], axis=-1))
-    # pairwise_distance = jnp.mean(
-    #     jnp.linalg.norm(samples[:, None, :] - samples[None, :, :], axis=-1)
-    # )
-
-    diff = samples[:, None, :] - samples[None, :, :]
-    sq_dist = jnp.sum(diff ** 2, axis=-1)
-    n = samples.shape[0]
-    mask = 1.0 - jnp.eye(n)
-    pairwise_distance = jnp.sum(jnp.sqrt(sq_dist + 1e-12) * mask) / jnp.sum(mask)
-    return truth_distance, pairwise_distance
-
-
 def energy_score_single(
     posterior_particles: Array,
     theta_true: Array,
@@ -432,9 +415,19 @@ def energy_score_single(
     It is a proper sample-based scoring rule: the second term prevents the degenerate
     policy objective that would reward collapsing every posterior sample to one point.
     """
-    truth_distance, pairwise_distance = energy_score_terms_single(
-        posterior_particles, theta_true, transport_cfg
-    )
+    samples = flatten_measure(posterior_particles, transport_cfg)
+    target = flatten_theta(theta_true, transport_cfg)
+    truth_distance = jnp.mean(jnp.linalg.norm(samples - target[None, :], axis=-1))
+    # pairwise_distance = jnp.mean(
+    #     jnp.linalg.norm(samples[:, None, :] - samples[None, :, :], axis=-1)
+    # )
+
+    diff = samples[:, None, :] - samples[None, :, :]
+    sq_dist = jnp.sum(diff ** 2, axis=-1)
+    n = samples.shape[0]
+    mask = 1.0 - jnp.eye(n)
+    pairwise_distance = jnp.sum(jnp.sqrt(sq_dist + 1e-12) * mask) / jnp.sum(mask)
+
     return truth_distance - 0.5 * pairwise_distance
 
 
@@ -463,192 +456,8 @@ def posterior_mean_rmse_single(
     return jnp.sqrt(jnp.mean((jnp.mean(samples, axis=0) - target) ** 2))
 
 
-#%% 5) REINFORCE policy objectives
-def _discounted_returns(rewards: Array, discount_factor: float) -> Array:
-    """Return G_t = sum_{k=t}^{T-1} gamma^(k-t) r_k for [time, batch] rewards."""
-    running = jnp.zeros_like(rewards[0])
-    reversed_returns = []
-    for reward in rewards[::-1]:
-        running = reward + discount_factor * running
-        reversed_returns.append(running)
-    return jnp.stack(reversed_returns[::-1], axis=0)
-
-
-def _leave_one_out_baseline(returns: Array) -> Array:
-    """Use the other batch episodes as an action-independent REINFORCE baseline."""
-    batch_size = returns.shape[1]
-    if batch_size <= 1:
-        return jnp.zeros_like(returns)
-    return (jnp.sum(returns, axis=1, keepdims=True) - returns) / (batch_size - 1)
-
-
-def _gaussian_design_sample(
-    proposed_design: Array,
-    key: Array,
-    transport_cfg: BayesTransportConfig,
-    policy_cfg: PolicyConfig,
-    *,
-    score_function_sample: bool,
-) -> tuple[Array, Array]:
-    """Sample a fixed-scale Gaussian design and return its summed log density."""
-    design_scale = (
-        policy_cfg.design_exploration_std
-        * (transport_cfg.design_high - transport_cfg.design_low)
-    )
-    safe_scale = max(design_scale, 1e-6)
-    noise = jax.random.normal(key, proposed_design.shape)
-    sampled_unclipped = proposed_design + design_scale * noise
-    if score_function_sample:
-        sampled_unclipped = jax.lax.stop_gradient(sampled_unclipped)
-    design = jnp.clip(
-        sampled_unclipped, transport_cfg.design_low, transport_cfg.design_high
-    )
-    standardised = (sampled_unclipped - proposed_design) / safe_scale
-    log_prob = jnp.sum(
-        -0.5 * standardised**2
-        - math.log(safe_scale)
-        - 0.5 * math.log(2.0 * math.pi),
-        axis=-1,
-    )
-    return design, log_prob
-
-
-def reinforce_objective(
-    candidate_policy: DesignPolicyTransformer,
-    theta_true: Array,
-    key: Array,
-    frozen_transport: BayesPushforwardTransformer,
-    transport_cfg: BayesTransportConfig,
-    policy_cfg: PolicyConfig,
-    reward_mode: str,
-):
-    """REINFORCE with discounted returns from one Stage-I energy-score term."""
-    batch_size = theta_true.shape[0]
-    key, prior_key = jax.random.split(key)
-    base_particles = transport_cfg.prior_std * jax.random.normal(
-        prior_key,
-        shape=(
-            batch_size,
-            policy_cfg.num_prior_particles,
-            transport_cfg.K,
-            2,
-        ),
-    )
-    context_x = jnp.zeros(
-        (batch_size, transport_cfg.max_context_pairs, 2), dtype=jnp.float32
-    )
-    context_y = jnp.zeros(
-        (batch_size, transport_cfg.max_context_pairs, 1), dtype=jnp.float32
-    )
-    context_mask = jnp.zeros(
-        (batch_size, transport_cfg.max_context_pairs), dtype=jnp.float32
-    )
-    posterior = jax.lax.stop_gradient(
-        jax.vmap(frozen_transport)(
-            base_particles, context_x, context_y, context_mask
-        )
-    )
-    previous_truth, previous_pairwise = jax.vmap(
-        lambda particles, theta: energy_score_terms_single(
-            particles, theta, transport_cfg
-        )
-    )(posterior, theta_true)
-
-    step_rewards = []
-    step_log_probs = []
-    step_energy_scores = []
-
-    for step in range(policy_cfg.horizon):
-        step_fraction = jnp.asarray(
-            step / max(policy_cfg.horizon - 1, 1), dtype=jnp.float32
-        )
-        proposed_design = jax.vmap(
-            lambda particles: candidate_policy(particles, step_fraction)
-        )(posterior)
-        key, design_noise_key, observation_key = jax.random.split(key, 3)
-        design, log_prob = _gaussian_design_sample(
-            proposed_design,
-            design_noise_key,
-            transport_cfg,
-            policy_cfg,
-            score_function_sample=True,
-        )
-        observation = simulate_observation_jax(
-            theta_true, design, transport_cfg, observation_key
-        )
-        context_x = context_x.at[:, step, :].set(design)
-        context_y = context_y.at[:, step, 0].set(observation)
-        context_mask = context_mask.at[:, step].set(1.0)
-
-        # Every posterior p(theta | D_t) is recomputed from the same prior sample Z
-        # and the complete context D_t.  Stage I was not trained as a one-step chain.
-        posterior = jax.lax.stop_gradient(
-            jax.vmap(frozen_transport)(
-                base_particles, context_x, context_y, context_mask
-            )
-        )
-        truth_distance, pairwise_distance = jax.vmap(
-            lambda particles, theta: energy_score_terms_single(
-                particles, theta, transport_cfg
-            )
-        )(posterior, theta_true)
-        if reward_mode == "truth_distance":
-            reward = previous_truth - truth_distance
-        elif reward_mode == "concentration":
-            reward = 0.5 * (previous_pairwise - pairwise_distance)
-        else:
-            raise ValueError("reward_mode must be 'truth_distance' or 'concentration'.")
-
-        step_rewards.append(jax.lax.stop_gradient(reward))
-        step_log_probs.append(log_prob)
-        step_energy_scores.append(truth_distance - 0.5 * pairwise_distance)
-        previous_truth = truth_distance
-        previous_pairwise = pairwise_distance
-
-    rewards = jnp.stack(step_rewards, axis=0)
-    log_probs = jnp.stack(step_log_probs, axis=0)
-    stacked_step_energy = jnp.stack(step_energy_scores, axis=0)
-    returns = _discounted_returns(rewards, policy_cfg.discount_factor)
-    baseline = _leave_one_out_baseline(returns)
-    advantages = jax.lax.stop_gradient(returns - baseline)
-    discount_powers = policy_cfg.discount_factor ** jnp.arange(policy_cfg.horizon)
-    policy_gradient_loss = -jnp.mean(
-        jnp.sum(discount_powers[:, None] * advantages * log_probs, axis=0)
-    )
-    discounted_episode_return = jnp.sum(
-        discount_powers[:, None] * rewards, axis=0
-    )
-
-    terminal_energy = stacked_step_energy[-1]
-    logdet = jax.vmap(
-        lambda particles: posterior_logdet_single(
-            particles, transport_cfg, policy_cfg.posterior_logdet_jitter
-        )
-    )(posterior)
-    rmse = jax.vmap(
-        lambda particles, theta: posterior_mean_rmse_single(
-            particles, theta, transport_cfg
-        )
-    )(posterior, theta_true)
-    metrics = {
-        "loss": -jnp.mean(discounted_episode_return),
-        "policy_gradient_loss": policy_gradient_loss,
-        "discounted_return": jnp.mean(discounted_episode_return),
-        "mean_step_reward": jnp.mean(rewards),
-        "terminal_energy_score": jnp.mean(terminal_energy),
-        "mean_step_energy_score": jnp.mean(stacked_step_energy),
-        "terminal_logdet": jnp.mean(logdet),
-        "terminal_mean_rmse": jnp.mean(rmse),
-        "terminal_truth_distance": jnp.mean(previous_truth),
-        "terminal_pairwise_distance": jnp.mean(previous_pairwise),
-        "distillation_mse": jnp.asarray(0.0),
-        "teacher_expected_gain": jnp.mean(rewards),
-        "teacher_target_distance": jnp.asarray(0.0),
-    }
-    return policy_gradient_loss, metrics
-
-
-def reinforce_truth_distance_objective(
+#%% 5) Differentiable simple policy objective
+def simple_energy_score_objective(
     candidate_policy: DesignPolicyTransformer,
     theta_true: Array,
     key: Array,
@@ -656,46 +465,15 @@ def reinforce_truth_distance_objective(
     transport_cfg: BayesTransportConfig,
     policy_cfg: PolicyConfig,
 ):
-    return reinforce_objective(
-        candidate_policy,
-        theta_true,
-        key,
-        frozen_transport,
-        transport_cfg,
-        policy_cfg,
-        "truth_distance",
-    )
+    """Energy-score objective for a batch of true parameters, summed over steps.
 
+    CHANGE (reversible): the loss is now the mean-over-batch of the *sum over every
+    rollout step* of the per-step energy score, instead of only the terminal step's
+    energy score. Set SUM_LOSS_OVER_STEPS=False below to restore the original
+    terminal-only objective (`loss = jnp.mean(terminal_energy)`).
+    """
+    SUM_LOSS_OVER_STEPS = True  # CHANGE (reversible): toggle to restore old behaviour
 
-def reinforce_concentration_objective(
-    candidate_policy: DesignPolicyTransformer,
-    theta_true: Array,
-    key: Array,
-    frozen_transport: BayesPushforwardTransformer,
-    transport_cfg: BayesTransportConfig,
-    policy_cfg: PolicyConfig,
-):
-    return reinforce_objective(
-        candidate_policy,
-        theta_true,
-        key,
-        frozen_transport,
-        transport_cfg,
-        policy_cfg,
-        "concentration",
-    )
-
-
-#%% 6) Reparameterised Gaussian policy objective
-def reparameterized_truth_distance_objective(
-    candidate_policy: DesignPolicyTransformer,
-    theta_true: Array,
-    key: Array,
-    frozen_transport: BayesPushforwardTransformer,
-    transport_cfg: BayesTransportConfig,
-    policy_cfg: PolicyConfig,
-):
-    """Differentiate the discounted truth-distance reward through Gaussian samples."""
     batch_size = theta_true.shape[0]
     key, prior_key = jax.random.split(key)
     base_particles = transport_cfg.prior_std * jax.random.normal(
@@ -719,13 +497,9 @@ def reparameterized_truth_distance_objective(
     posterior = jax.vmap(frozen_transport)(
         base_particles, context_x, context_y, context_mask
     )
-    previous_truth, previous_pairwise = jax.vmap(
-        lambda particles, theta: energy_score_terms_single(
-            particles, theta, transport_cfg
-        )
-    )(posterior, theta_true)
-
-    step_rewards = []
+    designs = []
+    # CHANGE: collect the per-step energy score instead of only keeping it for the
+    # final step.
     step_energy_scores = []
 
     for step in range(policy_cfg.horizon):
@@ -736,12 +510,14 @@ def reparameterized_truth_distance_objective(
             lambda particles: candidate_policy(particles, step_fraction)
         )(posterior)
         key, design_noise_key, observation_key = jax.random.split(key, 3)
-        design, _ = _gaussian_design_sample(
-            proposed_design,
-            design_noise_key,
-            transport_cfg,
-            policy_cfg,
-            score_function_sample=False,
+        exploration = jax.random.normal(design_noise_key, proposed_design.shape)
+        design = proposed_design + (
+            policy_cfg.design_exploration_std
+            * (transport_cfg.design_high - transport_cfg.design_low)
+            * exploration
+        )
+        design = jnp.clip(
+            design, transport_cfg.design_low, transport_cfg.design_high
         )
         observation = simulate_observation_jax(
             theta_true, design, transport_cfg, observation_key
@@ -755,26 +531,19 @@ def reparameterized_truth_distance_objective(
         posterior = jax.vmap(frozen_transport)(
             base_particles, context_x, context_y, context_mask
         )
-        truth_distance, pairwise_distance = jax.vmap(
-            lambda particles, theta: energy_score_terms_single(
+        designs.append(design)
+
+        # CHANGE: score this step's posterior and stash it for the (optional) sum.
+        step_energy = jax.vmap(
+            lambda particles, theta: energy_score_single(
                 particles, theta, transport_cfg
             )
         )(posterior, theta_true)
-        reward = previous_truth - truth_distance
-        step_rewards.append(reward)
-        step_energy_scores.append(truth_distance - 0.5 * pairwise_distance)
-        previous_truth = truth_distance
-        previous_pairwise = pairwise_distance
+        step_energy_scores.append(step_energy)
 
-    rewards = jnp.stack(step_rewards, axis=0)
-    stacked_step_energy = jnp.stack(step_energy_scores, axis=0)
-    discount_powers = policy_cfg.discount_factor ** jnp.arange(policy_cfg.horizon)
-    discounted_episode_return = jnp.sum(
-        discount_powers[:, None] * rewards, axis=0
-    )
-    loss = -jnp.mean(discounted_episode_return)
-
+    stacked_step_energy = jnp.stack(step_energy_scores, axis=0)  # [horizon, batch]
     terminal_energy = stacked_step_energy[-1]
+
     logdet = jax.vmap(
         lambda particles: posterior_logdet_single(
             particles, transport_cfg, policy_cfg.posterior_logdet_jitter
@@ -785,43 +554,30 @@ def reparameterized_truth_distance_objective(
             particles, theta, transport_cfg
         )
     )(posterior, theta_true)
+
+    if SUM_LOSS_OVER_STEPS:
+        # CHANGE: sum the energy score across all horizon steps (per sample), then
+        # average over the batch.
+        summed_energy_per_sample = jnp.sum(stacked_step_energy, axis=0)
+        loss = jnp.mean(summed_energy_per_sample)
+    else:
+        # Original terminal-only objective, kept for easy reversion.
+        loss = jnp.mean(terminal_energy)
+
     metrics = {
         "loss": loss,
-        "policy_gradient_loss": loss,
-        "discounted_return": jnp.mean(discounted_episode_return),
-        "mean_step_reward": jnp.mean(rewards),
         "terminal_energy_score": jnp.mean(terminal_energy),
-        "mean_step_energy_score": jnp.mean(stacked_step_energy),
+        "mean_step_energy_score": jnp.mean(stacked_step_energy),  # CHANGE: new diagnostic
         "terminal_logdet": jnp.mean(logdet),
         "terminal_mean_rmse": jnp.mean(rmse),
-        "terminal_truth_distance": jnp.mean(previous_truth),
-        "terminal_pairwise_distance": jnp.mean(previous_pairwise),
         "distillation_mse": jnp.asarray(0.0),
-        "teacher_expected_gain": jnp.mean(rewards),
+        "teacher_expected_gain": jnp.asarray(0.0),
         "teacher_target_distance": jnp.asarray(0.0),
     }
     return loss, metrics
 
 
-# Backwards-compatible function names retained for notebooks that imported them.
-def simple_energy_score_objective(
-    candidate_policy: DesignPolicyTransformer,
-    theta_true: Array,
-    key: Array,
-    frozen_transport: BayesPushforwardTransformer,
-    transport_cfg: BayesTransportConfig,
-    policy_cfg: PolicyConfig,
-):
-    return reparameterized_truth_distance_objective(
-        candidate_policy,
-        theta_true,
-        key,
-        frozen_transport,
-        transport_cfg,
-        policy_cfg,
-    )
-
-
+#%% 6) Self-distilled approximate-information-gain objective
 def self_distilled_single_objective(
     candidate_policy: DesignPolicyTransformer,
     theta_true: Array,
@@ -830,14 +586,134 @@ def self_distilled_single_objective(
     transport_cfg: BayesTransportConfig,
     policy_cfg: PolicyConfig,
 ):
-    loss, metrics = reinforce_concentration_objective(
-        candidate_policy,
-        theta_true[None, ...],
-        key,
-        frozen_transport,
-        transport_cfg,
-        policy_cfg,
+    """Distil a sample-based one-step information-gain teacher at one random state.
+
+    A random context D_t is first generated from the training simulator.  The teacher
+    then stops using theta_true: it samples theta~ from the current approximate
+    posterior, simulates y~p(y | theta~, x), refreshes p(theta | D_t union {(x,y)})
+    through T_phi, and scores the reduction in posterior log-volume.
+    """
+    (
+        history_key,
+        prior_key,
+        policy_key,
+        candidate_key,
+        teacher_key,
+    ) = jax.random.split(key, 5)
+    history_length = jax.random.randint(
+        history_key, shape=(), minval=0, maxval=policy_cfg.horizon
     )
+
+    base_particles = transport_cfg.prior_std * jax.random.normal(
+        prior_key,
+        shape=(
+            policy_cfg.num_prior_particles,
+            transport_cfg.K,
+            2,
+        ),
+    )
+    context_x = jax.random.uniform(
+        candidate_key,
+        shape=(transport_cfg.max_context_pairs, 2),
+        minval=transport_cfg.design_low,
+        maxval=transport_cfg.design_high,
+    )
+    teacher_key, history_noise_key, random_candidate_key = jax.random.split(
+        teacher_key, 3
+    )
+    history_mean = source_log_signal_jax(theta_true, context_x, transport_cfg)
+    history_y = history_mean + transport_cfg.observation_noise_std * jax.random.normal(
+        history_noise_key, history_mean.shape
+    )
+    context_mask = (
+        jnp.arange(transport_cfg.max_context_pairs) < history_length
+    ).astype(jnp.float32)
+    context_y = history_y[:, None] * context_mask[:, None]
+    context_x = context_x * context_mask[:, None]
+
+    posterior = frozen_transport(
+        base_particles, context_x, context_y, context_mask
+    )
+    step_fraction = history_length.astype(jnp.float32) / max(
+        policy_cfg.horizon - 1, 1
+    )
+    policy_design = candidate_policy(posterior, step_fraction)
+
+    if policy_cfg.teacher_candidates < 2:
+        raise ValueError("teacher_candidates must be at least 2.")
+    random_candidates = jax.random.uniform(
+        random_candidate_key,
+        shape=(policy_cfg.teacher_candidates - 1, 2),
+        minval=transport_cfg.design_low,
+        maxval=transport_cfg.design_high,
+    )
+    # Include the policy's own proposal in the candidate pool.  The distilled target
+    # is stop-gradient, so the teacher cannot be gamed through this inclusion.
+    candidates = jnp.concatenate(
+        [jax.lax.stop_gradient(policy_design[None, :]), random_candidates], axis=0
+    )
+    current_logdet = posterior_logdet_single(
+        posterior, transport_cfg, policy_cfg.posterior_logdet_jitter
+    )
+    candidate_keys = jax.random.split(teacher_key, policy_cfg.teacher_candidates)
+
+    def candidate_expected_next_logdet(candidate: Array, candidate_root_key: Array):
+        outcome_keys = jax.random.split(
+            candidate_root_key, policy_cfg.teacher_outcome_samples
+        )
+
+        def one_hypothetical_outcome(outcome_key: Array):
+            index_key, observation_key = jax.random.split(outcome_key)
+            particle_index = jax.random.randint(
+                index_key,
+                shape=(),
+                minval=0,
+                maxval=policy_cfg.num_prior_particles,
+            )
+            theta_hypothetical = posterior[particle_index]
+            observation = simulate_observation_jax(
+                theta_hypothetical, candidate, transport_cfg, observation_key
+            )
+            next_x = context_x.at[history_length].set(candidate)
+            next_y = context_y.at[history_length, 0].set(observation)
+            next_mask = context_mask.at[history_length].set(1.0)
+            next_posterior = frozen_transport(
+                base_particles, next_x, next_y, next_mask
+            )
+            return posterior_logdet_single(
+                next_posterior,
+                transport_cfg,
+                policy_cfg.posterior_logdet_jitter,
+            )
+
+        return jnp.mean(jax.vmap(one_hypothetical_outcome)(outcome_keys))
+
+    expected_next_logdet = jax.vmap(candidate_expected_next_logdet)(
+        candidates, candidate_keys
+    )
+    estimated_gain = current_logdet - expected_next_logdet
+    target_weights = jax.nn.softmax(
+        estimated_gain / max(policy_cfg.teacher_softmax_temperature, 1e-6)
+    )
+    target_design = jax.lax.stop_gradient(
+        jnp.sum(target_weights[:, None] * candidates, axis=0)
+    )
+
+    # Exactly one self-distillation objective term.
+    loss = jnp.mean((policy_design - target_design) ** 2)
+    best_candidate = candidates[jnp.argmax(estimated_gain)]
+    target_distance = jnp.sqrt(jnp.mean((policy_design - best_candidate) ** 2))
+    metrics = {
+        "loss": loss,
+        "terminal_energy_score": jnp.asarray(0.0),
+        "terminal_logdet": current_logdet,
+        "terminal_mean_rmse": posterior_mean_rmse_single(
+            posterior, theta_true, transport_cfg
+        ),
+        "distillation_mse": loss,
+        "teacher_expected_gain": jnp.sum(target_weights * estimated_gain),
+        "teacher_target_distance": target_distance,
+    }
     return loss, metrics
 
 
@@ -849,14 +725,19 @@ def self_distilled_eig_objective(
     transport_cfg: BayesTransportConfig,
     policy_cfg: PolicyConfig,
 ):
-    return reinforce_concentration_objective(
-        candidate_policy,
-        theta_true,
-        key,
-        frozen_transport,
-        transport_cfg,
-        policy_cfg,
-    )
+    batch_keys = jax.random.split(key, theta_true.shape[0])
+    losses, metrics = jax.vmap(
+        lambda theta, sample_key: self_distilled_single_objective(
+            candidate_policy,
+            theta,
+            sample_key,
+            frozen_transport,
+            transport_cfg,
+            policy_cfg,
+        )
+    )(theta_true, batch_keys)
+    mean_metrics = jax.tree.map(lambda value: jnp.mean(value), metrics)
+    return jnp.mean(losses), mean_metrics
 
 
 #%% 7) Deployment-faithful rollout and adapted diagnostic plots
@@ -1145,17 +1026,8 @@ def train_variant(
     inference_run_dir: Path,
     inference_checkpoint: Path,
 ):
-    objective_functions = {
-        "reinforce_truth_distance": reinforce_truth_distance_objective,
-        "reinforce_concentration": reinforce_concentration_objective,
-        "reparameterized_truth_distance": reparameterized_truth_distance_objective,
-    }
-    if cfg.objective_mode not in objective_functions:
+    if cfg.objective_mode not in {"simple_energy_score", "self_distilled_eig"}:
         raise ValueError("train_variant expects one concrete objective mode.")
-    if not 0.0 <= cfg.discount_factor <= 1.0:
-        raise ValueError("discount_factor must lie in [0, 1].")
-    if cfg.objective_mode.startswith("reinforce_") and cfg.design_exploration_std <= 0.0:
-        raise ValueError("REINFORCE requires design_exploration_std > 0.")
 
     np.random.seed(cfg.seed)
     prior = SourceLocPrior(K=transport_cfg.K, prior_std=transport_cfg.prior_std)
@@ -1211,7 +1083,10 @@ def train_variant(
     )
     opt_state = optimizer.init(eqx.filter(policy, eqx.is_array))
 
-    objective_fn = objective_functions[cfg.objective_mode]
+    if cfg.objective_mode == "simple_energy_score":
+        objective_fn = simple_energy_score_objective
+    else:
+        objective_fn = self_distilled_eig_objective
 
     @eqx.filter_jit
     def train_step(candidate_policy, candidate_opt_state, theta_true, key):
@@ -1247,7 +1122,7 @@ def train_variant(
 
     @eqx.filter_jit
     def eval_rollout_step(candidate_policy, theta_true, key):
-        _, metrics = reparameterized_truth_distance_objective(
+        _, metrics = simple_energy_score_objective(
             candidate_policy,
             theta_true,
             key,
@@ -1310,7 +1185,6 @@ def train_variant(
         "step_energy": [],
         "step_distillation": [],
         "step_teacher_gain": [],
-        "step_return": [],
         "step_grad_norm": [],
         "epoch_train_loss": [],
         "epoch_val_objective": [],
@@ -1358,13 +1232,19 @@ def train_variant(
             history["step_energy"].append(host["terminal_energy_score"])
             history["step_distillation"].append(host["distillation_mse"])
             history["step_teacher_gain"].append(host["teacher_expected_gain"])
-            history["step_return"].append(host["discounted_return"])
             history["step_grad_norm"].append(host_grad_norm)
-            progress.set_postfix(
-                loss=f"{host['loss']:.4f}",
-                return_=f"{host['discounted_return']:.4f}",
-                energy=f"{host['terminal_energy_score']:.4f}",
-            )
+            if cfg.objective_mode == "simple_energy_score":
+                progress.set_postfix(
+                    loss=f"{host['loss']:.4f}",
+                    energy=f"{host['terminal_energy_score']:.4f}",
+                    rmse=f"{host['terminal_mean_rmse']:.3f}",
+                )
+            else:
+                progress.set_postfix(
+                    loss=f"{host['loss']:.4f}",
+                    gain=f"{host['teacher_expected_gain']:.3f}",
+                    target=f"{host['teacher_target_distance']:.3f}",
+                )
 
         epoch_train_loss = float(np.mean(train_losses_this_epoch))
         val_metrics = evaluate(policy, eval_loader, cfg.seed + 100_000)
@@ -1478,12 +1358,14 @@ def train_variant(
     top_gs = fig.add_gridspec(3, 1, height_ratios=[2.0, 2.0, 2.6])
     step_gs = top_gs[0:2].subgridspec(2, 2, hspace=0.35, wspace=0.28)
 
-    # The same four panels are retained for every estimator: optimisation loss,
-    # terminal energy score, discounted return, and gradient norm.
+    # For self_distilled_eig, step_energy/step_teacher_gain carry the meaningful
+    # signal; for simple_energy_score, step_energy/step_grad_norm do. Both are always
+    # populated (zeros for the inactive objective's fields), so the same four panels
+    # work for either variant.
     step_panels = [
         ("step_loss", "training loss", "#1f77b4"),
         ("step_energy", "terminal energy score", "#d62728"),
-        ("step_return", "discounted return", "#2ca02c"),
+        ("step_distillation", "distillation MSE", "#2ca02c"),
         ("step_grad_norm", "gradient norm", "#9467bd"),
     ]
 
@@ -1605,21 +1487,14 @@ print("Frozen Stage-I run:", inference_run_dir)
 print("Transport configuration:\n", yaml.safe_dump(asdict(transport_cfg), sort_keys=False))
 
 mode = POLICY_CFG.objective_mode.lower()
-all_variants = [
-    "reinforce_truth_distance",
-    "reinforce_concentration",
-    "reparameterized_truth_distance",
-]
-if mode == "all":
-    variants = all_variants
-elif mode == "both":
-    variants = all_variants[:2]
-elif mode in set(all_variants):
+if mode == "both":
+    variants = ["simple_energy_score", "self_distilled_eig"]
+elif mode in {"simple_energy_score", "self_distilled_eig"}:
     variants = [mode]
 else:
     raise ValueError(
-        "objective_mode must be one of: all, both, reinforce_truth_distance, "
-        "reinforce_concentration, reparameterized_truth_distance."
+        "objective_mode must be one of: both, simple_energy_score, "
+        "self_distilled_eig."
     )
 
 run_dirs = []
