@@ -139,9 +139,9 @@ class BayesTransportConfig:
     # Heterogeneous training-task distribution.  Arrays are padded to these maxima,
     # while masks ensure that inactive source/coordinate slots never enter an embedder.
     min_num_sources: int = 1
-    max_num_sources: int = 4
+    max_num_sources: int = 8
     min_source_dim: int = 1
-    max_source_dim: int = 4
+    max_source_dim: int = 8
 
     # TAMO-style dimension aggregation.  Every observation and every theta particle is
     # mapped to one fixed E-vector before it reaches either main Transformer.  The hard
