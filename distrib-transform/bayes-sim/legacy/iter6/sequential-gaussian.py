@@ -150,7 +150,7 @@ class BayesTransportConfig:
     embedding_heads: int = 8
 
     # Mode-A trajectory and particle counts.
-    trajectory_length: int = 8
+    trajectory_length: int = 16
     num_particles: int = 64
     n_train_trajectories: int = 4096
     n_eval_trajectories: int = 256
@@ -174,7 +174,7 @@ class BayesTransportConfig:
     epochs: int = 120
     learning_rate: float = 1e-4
     weight_decay: float = 1e-4
-    grad_clip_norm: float = 10.0
+    # grad_clip_norm: float = 10.0
     sigreg_weight: float = 0.1              # set to 0.0 to disable
     sigreg_knots: int = 17
     sigreg_num_proj: int = 1024
@@ -185,13 +185,13 @@ class BayesTransportConfig:
     decoder_hidden_dim: int = 128
     decoder_heads: int = 8
     decoder_depth: int = 2
-    decoder_epochs: int = 500
+    decoder_epochs: int = 5000
     decoder_learning_rate: float = 1e-4
     decoder_batch_size: int = 128
     decoder_train_samples: int = 8192
 
     # Persistence / visualisation cadence.
-    save_every_epochs: int = 100
+    save_every_epochs: int = 10
     final_plot_examples: int = 3
     grid_size: int = 180
 
@@ -1710,7 +1710,7 @@ def train_model(
     print("\nsequential AdaLN")
     print_model_parameter_count(model)
     optimizer = optax.chain(
-        optax.clip_by_global_norm(cfg.grad_clip_norm),
+        # optax.clip_by_global_norm(cfg.grad_clip_norm),
         optax.adamw(learning_rate=cfg.learning_rate, weight_decay=cfg.weight_decay),
     )
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
@@ -1782,6 +1782,7 @@ def train_model(
             desc=f"sequential epoch {epoch:03d}/{cfg.epochs:03d}",
             dynamic_ncols=True,
             leave=True,
+            mininterval=5.0,
         )
 
         for batch_index in progress:
@@ -1809,7 +1810,7 @@ def train_model(
             history["step_grad_norm"].append(host_grad_norm)
             progress.set_postfix(
                 L=f"{host_loss:.4f}", ES=f"{float(host['energy_score']):.4f}",
-                SIG=f"{float(host['sigreg_loss']):.2f}", grad=f"{host_grad_norm:.3f}",
+                SIG=f"{float(host['sigreg_loss']):.2f}", grad=f"{host_grad_norm:.3f}", refresh=False,
             )
 
         epoch_train_loss = float(np.mean(train_losses_this_epoch))

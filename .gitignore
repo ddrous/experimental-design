@@ -11,3 +11,6 @@ source-loc/world-model/runs/
 *npy
 
 *runs/
+
+*.log
+distrib-transform/bayes-sim/nohup.log
