@@ -1,116 +1,0 @@
-JAX devices: [CudaDevice(id=0)]
-Configuration:
- env_name: sequential
-seed: 2030
-runs_base: ./runs
-num_sources: 2
-source_dim: 2
-prior_std: 1.0
-use_meta_prior: false
-meta_prior_min_components: 1
-meta_prior_max_components: 8
-meta_prior_component_mean_std: 1.5
-meta_prior_component_std_min: 0.2
-meta_prior_component_std_max: 2.0
-meta_prior_dirichlet_concentration: 1.0
-meta_prior_degenerate_probability: 0.01
-meta_prior_degenerate_std: 0.0
-design_low: -3.0
-design_high: 3.0
-background: 0.1
-source_strength: 1.0
-softening: 0.1
-observation_noise_std: 0.3
-min_num_sources: 1
-max_num_sources: 4
-min_source_dim: 1
-max_source_dim: 4
-embedding_dim: 192
-dimension_embedder_depth: 4
-scalar_encoder_depth: 4
-embedding_heads: 8
-trajectory_length: 16
-max_observations_per_step: 4
-test_observations_per_step: 4
-num_particles: 64
-n_train_trajectories: 4096
-n_eval_trajectories: 256
-batch_size: 4
-train_dataloader_num_workers: 0
-train_dataloader_prefetch_factor: 2
-hidden_dim: 256
-heads: 8
-mlp_ratio: 4
-posterior_depth: 6
-max_embedding_displacement: 6.0
-canonicalize_particle_sources: false
-y_center: 0.0
-y_scale: 3.0
-epochs: 350
-learning_rate: 1.0e-05
-weight_decay: 0.0001
-sigreg_weight: 0.1
-sigreg_knots: 17
-sigreg_num_proj: 1024
-sigreg_t_max: 3.0
-decoder_hidden_dim: 128
-decoder_heads: 8
-decoder_depth: 4
-decoder_epochs: 10000
-decoder_learning_rate: 0.0001
-decoder_batch_size: 128
-decoder_train_samples: 8192
-decoder_permutation_invariant_loss: false
-decoder_plateau_eval_samples: 256
-decoder_plateau_patience: 500
-decoder_plateau_factor: 0.5
-decoder_plateau_rtol: 0.001
-decoder_plateau_atol: 0.0
-decoder_plateau_cooldown: 100
-decoder_plateau_min_scale: 0.015625
-save_every_epochs: 10
-final_plot_examples: 3
-grid_size: 180
-reference_proposals: 10000
-reference_particles: 2000
-limit_eval_trajectories: 192
-particle_limit_values:
-- 16
-- 32
-- 64
-long_trajectory_length: 192
-trajectory_mc_values:
-- 8
-- 16
-- 32
-- 64
-prior_resample_repeats: 12
-
-Run directory: /home/ddrous/Projects/ExperimentalDesign/distrib-transform/bayes-sim/runs/sequential_260813-214009
-Continuous training stream:
-  fresh trajectories per nominal epoch: 4096
-  batch size (unchanged): 4
-  S uniformly sampled in [1, 4]
-  D uniformly sampled in [1, 4]
-  t=0 prior mode: fixed Gaussian N(0, 1.0^2 I)
-Figure(1500x520)
-Figure(1320x540)
-
-sequential cross-attention
-Total parameters: 11.992 M
-  Design-Outcome embedder : 2,074,944
-  Likelihood Transformer  : 1,776,768
-  Theta embedder          : 1,926,912
-  Posterior Transformer   : 6,213,312
-  SIGReg                  : 0
-Figure(1540x950)
-[sequential] initial validation total=7.210059 | ES=0.527560 | SIGReg=66.8250
-sequential epoch 001/350:   0%|          | 0/1024 [00:00<?, ?it/s]sequential epoch 001/350:   0%|          | 1/1024 [01:36<27:18:45, 96.11s/it, ES=0.5116, L=7.0623, SIG=65.51, grad=194.853]sequential epoch 001/350:   5%|▌         | 53/1024 [01:41<22:13,  1.37s/it, ES=0.1545, L=6.9135, SIG=67.59, grad=501.598]  sequential epoch 001/350:  10%|█         | 106/1024 [01:46<09:28,  1.61it/s, ES=0.0982, L=7.0214, SIG=69.23, grad=431.240]sequential epoch 001/350:  15%|█▌        | 158/1024 [01:51<05:32,  2.61it/s, ES=0.0562, L=6.6912, SIG=66.35, grad=483.991]sequential epoch 001/350:  21%|██        | 210/1024 [01:56<03:41,  3.68it/s, ES=0.1105, L=6.7494, SIG=66.39, grad=654.426]sequential epoch 001/350:  26%|██▌       | 263/1024 [02:01<02:38,  4.82it/s, ES=0.0839, L=6.7156, SIG=66.32, grad=642.859]sequential epoch 001/350:  31%|███       | 315/1024 [02:06<02:00,  5.88it/s, ES=0.0526, L=6.5744, SIG=65.22, grad=667.330]sequential epoch 001/350:  36%|███▌      | 367/1024 [02:11<01:35,  6.85it/s, ES=0.0591, L=6.6103, SIG=65.51, grad=570.238]sequential epoch 001/350:  41%|████      | 419/1024 [02:16<01:19,  7.62it/s, ES=0.0469, L=6.6375, SIG=65.91, grad=562.198]sequential epoch 001/350:  46%|████▌     | 471/1024 [02:21<01:06,  8.28it/s, ES=0.0324, L=6.5870, SIG=65.55, grad=634.849]sequential epoch 001/350:  51%|█████▏    | 525/1024 [02:26<00:55,  8.92it/s, ES=0.0330, L=6.3208, SIG=62.88, grad=631.382]sequential epoch 001/350:  56%|█████▋    | 578/1024 [02:31<00:47,  9.32it/s, ES=0.0302, L=6.4042, SIG=63.74, grad=669.624]sequential epoch 001/350:  62%|██████▏   | 630/1024 [02:37<00:41,  9.57it/s, ES=0.0247, L=6.4111, SIG=63.86, grad=597.494]sequential epoch 001/350:  67%|██████▋   | 682/1024 [02:42<00:35,  9.75it/s, ES=0.0335, L=6.6556, SIG=66.22, grad=535.505]sequential epoch 001/350:  72%|███████▏  | 734/1024 [02:47<00:29,  9.88it/s, ES=0.0279, L=6.3370, SIG=63.09, grad=619.706]sequential epoch 001/350:  77%|███████▋  | 786/1024 [02:52<00:23,  9.93it/s, ES=0.0181, L=6.3514, SIG=63.33, grad=567.686]sequential epoch 001/350:  82%|████████▏ | 838/1024 [02:57<00:18, 10.03it/s, ES=0.0214, L=6.5635, SIG=65.42, grad=592.350]sequential epoch 001/350:  87%|████████▋ | 890/1024 [03:02<00:13, 10.13it/s, ES=0.0193, L=6.3849, SIG=63.66, grad=642.005]sequential epoch 001/350:  92%|█████████▏| 944/1024 [03:07<00:07, 10.28it/s, ES=0.0238, L=6.1035, SIG=60.80, grad=586.383]sequential epoch 001/350:  97%|█████████▋| 996/1024 [03:12<00:02, 10.29it/s, ES=0.0178, L=6.4403, SIG=64.22, grad=639.737]sequential epoch 001/350: 100%|██████████| 1024/1024 [03:15<00:00,  5.24it/s, ES=0.0187, L=6.3816, SIG=63.63, grad=483.191]
-[sequential] epoch 001: train total=6.592743 | val total=6.380874 | val ES=0.021789 | SIGReg=63.591 | final ES=0.035379 | embedding RMSE=0.00202 | 196.6s
-sequential epoch 002/350:   0%|          | 0/1024 [00:00<?, ?it/s]sequential epoch 002/350:   5%|▍         | 48/1024 [00:05<01:43,  9.45it/s, ES=0.0189, L=6.4297, SIG=64.11, grad=680.751]sequential epoch 002/350:   9%|▉         | 96/1024 [00:10<01:37,  9.50it/s, ES=0.0228, L=6.3855, SIG=63.63, grad=666.625]sequential epoch 002/350:  14%|█▍        | 144/1024 [00:15<01:32,  9.52it/s, ES=0.0223, L=6.2497, SIG=62.27, grad=585.487]sequential epoch 002/350:  19%|█▉        | 192/1024 [00:20<01:27,  9.47it/s, ES=0.0187, L=6.1069, SIG=60.88, grad=641.008]sequential epoch 002/350:  23%|██▎       | 240/1024 [00:25<01:22,  9.47it/s, ES=0.0189, L=6.4079, SIG=63.89, grad=677.997]sequential epoch 002/350:  28%|██▊       | 288/1024 [00:30<01:18,  9.43it/s, ES=0.0176, L=5.8770, SIG=58.59, grad=619.797]sequential epoch 002/350:  33%|███▎      | 337/1024 [00:35<01:12,  9.49it/s, ES=0.0170, L=6.2982, SIG=62.81, grad=664.992]sequential epoch 002/350:  38%|███▊      | 385/1024 [00:40<01:07,  9.41it/s, ES=0.0173, L=6.0703, SIG=60.53, grad=641.199]sequential epoch 002/350:  42%|████▏     | 433/1024 [00:45<01:02,  9.44it/s, ES=0.0185, L=5.9548, SIG=59.36, grad=645.001]sequential epoch 002/350:  47%|████▋     | 481/1024 [00:50<00:57,  9.38it/s, ES=0.0185, L=6.3638, SIG=63.45, grad=527.446]sequential epoch 002/350:  52%|█████▏    | 528/1024 [00:56<00:53,  9.32it/s, ES=0.0141, L=5.9887, SIG=59.75, grad=630.932]sequential epoch 002/350:  56%|█████▋    | 577/1024 [01:01<00:47,  9.41it/s, ES=0.0155, L=5.9242, SIG=59.09, grad=646.691]sequential epoch 002/350:  61%|██████    | 625/1024 [01:06<00:42,  9.38it/s, ES=0.0175, L=5.9044, SIG=58.87, grad=642.707]sequential epoch 002/350:  66%|██████▌   | 672/1024 [01:11<00:37,  9.34it/s, ES=0.0132, L=5.9613, SIG=59.48, grad=638.149]sequential epoch 002/350:  70%|███████   | 719/1024 [01:16<00:32,  9.34it/s, ES=0.0150, L=6.0984, SIG=60.83, grad=614.995]sequential epoch 002/350:  75%|███████▍  | 766/1024 [01:21<00:27,  9.34it/s, ES=0.0164, L=6.0412, SIG=60.25, grad=662.689]sequential epoch 002/350:  80%|███████▉  | 815/1024 [01:26<00:22,  9.47it/s, ES=0.0140, L=5.9103, SIG=58.96, grad=668.317]sequential epoch 002/350:  84%|████████▍ | 863/1024 [01:31<00:17,  9.46it/s, ES=0.0157, L=6.0103, SIG=59.95, grad=659.889]sequential epoch 002/350:  89%|████████▉ | 911/1024 [01:36<00:11,  9.45it/s, ES=0.0161, L=5.9063, SIG=58.90, grad=648.775]sequential epoch 002/350:  94%|█████████▎| 959/1024 [01:41<00:06,  9.48it/s, ES=0.0148, L=5.9098, SIG=58.95, grad=529.972]sequential epoch 002/350:  98%|█████████▊| 1008/1024 [01:46<00:01,  9.54it/s, ES=0.0122, L=5.8381, SIG=58.26, grad=601.747]sequential epoch 002/350: 100%|██████████| 1024/1024 [01:48<00:00,  9.45it/s, ES=0.0153, L=5.9723, SIG=59.57, grad=589.665]
-[sequential] epoch 002: train total=6.143566 | val total=5.948326 | val ES=0.014191 | SIGReg=59.341 | final ES=0.022912 | embedding RMSE=0.00132 | 109.5s
-sequential epoch 003/350:   0%|          | 0/1024 [00:00<?, ?it/s]sequential epoch 003/350:   5%|▍         | 47/1024 [00:05<01:45,  9.25it/s, ES=0.0156, L=5.8511, SIG=58.36, grad=710.254]sequential epoch 003/350:   9%|▉         | 95/1024 [00:10<01:38,  9.42it/s, ES=0.0148, L=5.9629, SIG=59.48, grad=701.419]sequential epoch 003/350:  14%|█▍        | 143/1024 [00:15<01:34,  9.36it/s, ES=0.0141, L=5.7901, SIG=57.76, grad=638.163]sequential epoch 003/350:  19%|█▊        | 190/1024 [00:20<01:29,  9.34it/s, ES=0.0173, L=5.8708, SIG=58.54, grad=623.174]sequential epoch 003/350:  23%|██▎       | 237/1024 [00:25<01:24,  9.34it/s, ES=0.0108, L=5.6908, SIG=56.80, grad=602.448]sequential epoch 003/350:  28%|██▊       | 285/1024 [00:30<01:18,  9.36it/s, ES=0.0146, L=5.7106, SIG=56.96, grad=515.356]sequential epoch 003/350:  33%|███▎      | 334/1024 [00:35<01:13,  9.45it/s, ES=0.0203, L=5.6753, SIG=56.55, grad=614.276]sequential epoch 003/350:  37%|███▋      | 382/1024 [00:40<01:08,  9.41it/s, ES=0.0115, L=5.7628, SIG=57.51, grad=576.603]sequential epoch 003/350:  42%|████▏     | 430/1024 [00:45<01:03,  9.35it/s, ES=0.0131, L=5.7884, SIG=57.75, grad=602.458]sequential epoch 003/350:  47%|████▋     | 477/1024 [00:50<00:58,  9.32it/s, ES=0.0166, L=5.8040, SIG=57.87, grad=554.770]sequential epoch 003/350:  51%|█████▏    | 525/1024 [00:56<00:53,  9.35it/s, ES=0.0139, L=5.5427, SIG=55.29, grad=653.813]sequential epoch 003/350:  56%|█████▌    | 574/1024 [01:01<00:47,  9.43it/s, ES=0.0148, L=5.9240, SIG=59.09, grad=702.085]sequential epoch 003/350:  61%|██████    | 622/1024 [01:06<00:42,  9.40it/s, ES=0.0096, L=5.6755, SIG=56.66, grad=661.154]sequential epoch 003/350:  65%|██████▌   | 669/1024 [01:11<00:37,  9.37it/s, ES=0.0111, L=5.6057, SIG=55.95, grad=665.207]sequential epoch 003/350:  70%|██████▉   | 716/1024 [01:16<00:32,  9.37it/s, ES=0.0113, L=5.6749, SIG=56.64, grad=666.553]sequential epoch 003/350:  75%|███████▍  | 763/1024 [01:21<00:27,  9.38it/s, ES=0.0118, L=5.5925, SIG=55.81, grad=682.287]sequential epoch 003/350:  79%|███████▉  | 811/1024 [01:26<00:22,  9.42it/s, ES=0.0122, L=5.7690, SIG=57.57, grad=653.248]sequential epoch 003/350:  84%|████████▍ | 859/1024 [01:31<00:17,  9.39it/s, ES=0.0120, L=5.7498, SIG=57.38, grad=637.210]sequential epoch 003/350:  88%|████████▊ | 906/1024 [01:36<00:12,  9.37it/s, ES=0.0106, L=5.7639, SIG=57.53, grad=676.009]sequential epoch 003/350:  93%|█████████▎| 953/1024 [01:41<00:07,  9.37it/s, ES=0.0174, L=5.6512, SIG=56.34, grad=638.391]sequential epoch 003/350:  98%|█████████▊| 1000/1024 [01:46<00:02,  9.34it/s, ES=0.0106, L=5.5341, SIG=55.23, grad=593.376]sequential epoch 003/350: 100%|██████████| 1024/1024 [01:49<00:00,  9.38it/s, ES=0.0129, L=5.7143, SIG=57.01, grad=650.043]
-[sequential] epoch 003: train total=5.767885 | val total=5.646712 | val ES=0.013984 | SIGReg=56.327 | final ES=0.024111 | embedding RMSE=0.00128 | 110.3s
-sequential epoch 004/350:   0%|          | 0/1024 [00:00<?, ?it/s]sequential epoch 004/350:   5%|▍         | 48/1024 [00:05<01:42,  9.52it/s, ES=0.0109, L=5.8114, SIG=58.00, grad=638.917]sequential epoch 004/350:   9%|▉         | 96/1024 [00:10<01:38,  9.38it/s, ES=0.0110, L=5.8060, SIG=57.95, grad=590.436]sequential epoch 004/350:  14%|█▍        | 145/1024 [00:15<01:31,  9.56it/s, ES=0.0131, L=5.6625, SIG=56.49, grad=673.377]sequential epoch 004/350:  19%|█▉        | 193/1024 [00:20<01:27,  9.47it/s, ES=0.0086, L=5.5935, SIG=55.85, grad=655.720]sequential epoch 004/350:  24%|██▎       | 241/1024 [00:25<01:22,  9.45it/s, ES=0.0127, L=5.4710, SIG=54.58, grad=655.619]sequential epoch 004/350:  28%|██▊       | 289/1024 [00:30<01:17,  9.46it/s, ES=0.0097, L=5.7083, SIG=56.99, grad=655.593]sequential epoch 004/350:  33%|███▎      | 337/1024 [00:35<01:13,  9.40it/s, ES=0.0100, L=5.3605, SIG=53.50, grad=680.925]sequential epoch 004/350:  38%|███▊      | 387/1024 [00:40<01:06,  9.54it/s, ES=0.0132, L=5.5195, SIG=55.06, grad=667.135]sequential epoch 004/350:  42%|████▏     | 435/1024 [00:45<01:01,  9.55it/s, ES=0.0148, L=5.3558, SIG=53.41, grad=672.863]sequential epoch 004/350:  47%|████▋     | 483/1024 [00:50<00:56,  9.50it/s, ES=0.0104, L=5.5328, SIG=55.22, grad=664.843]sequential epoch 004/350:  52%|█████▏    | 531/1024 [00:55<00:51,  9.48it/s, ES=0.0124, L=5.5623, SIG=55.50, grad=643.301]sequential epoch 004/350:  57%|█████▋    | 579/1024 [01:01<00:47,  9.46it/s, ES=0.0116, L=5.4434, SIG=54.32, grad=646.240]sequential epoch 004/350:  61%|██████▏   | 628/1024 [01:06<00:41,  9.56it/s, ES=0.0103, L=5.4936, SIG=54.83, grad=598.428]sequential epoch 004/350:  66%|██████▌   | 676/1024 [01:11<00:36,  9.49it/s, ES=0.0092, L=5.6272, SIG=56.18, grad=663.255]sequential epoch 004/350:  71%|███████   | 724/1024 [01:16<00:31,  9.48it/s, ES=0.0096, L=5.4161, SIG=54.07, grad=663.850]sequential epoch 004/350:  75%|███████▌  | 772/1024 [01:21<00:26,  9.45it/s, ES=0.0088, L=5.4086, SIG=54.00, grad=702.762]sequential epoch 004/350:  80%|████████  | 820/1024 [01:26<00:21,  9.45it/s, ES=0.0091, L=5.4641, SIG=54.55, grad=656.588]sequential epoch 004/350:  85%|████████▍ | 870/1024 [01:31<00:16,  9.57it/s, ES=0.0094, L=5.5499, SIG=55.41, grad=675.122]sequential epoch 004/350:  90%|████████▉ | 918/1024 [01:36<00:11,  9.50it/s, ES=0.0131, L=5.5336, SIG=55.21, grad=693.205]sequential epoch 004/350:  94%|█████████▍| 966/1024 [01:41<00:06,  9.46it/s, ES=0.0096, L=5.4122, SIG=54.03, grad=648.448]sequential epoch 004/350:  99%|█████████▉| 1014/1024 [01:46<00:01,  9.42it/s, ES=0.0079, L=5.5650, SIG=55.57, grad=651.989]sequential epoch 004/350: 100%|██████████| 1024/1024 [01:48<00:00,  9.48it/s, ES=0.0106, L=5.4719, SIG=54.61, grad=648.922]
-[sequential] epoch 004: train total=5.538542 | val total=5.466701 | val ES=0.010669 | SIGReg=54.560 | final ES=0.019127 | embedding RMSE=0.00094 | 109.3s
-sequential epoch 005/350:   0%|          | 0/1024 [00:00<?, ?it/s]sequential epoch 005/350:   5%|▍         | 48/1024 [00:05<01:43,  9.46it/s, ES=0.0102, L=5.4197, SIG=54.09, grad=598.431]sequential epoch 005/350:   9%|▉         | 96/1024 [00:10<01:37,  9.52it/s, ES=0.0134, L=5.5807, SIG=55.67, grad=711.118]sequential epoch 005/350:  14%|█▍        | 145/1024 [00:15<01:31,  9.61it/s, ES=0.0086, L=5.3306, SIG=53.22, grad=600.297]sequential epoch 005/350:  19%|█▉        | 194/1024 [00:20<01:26,  9.56it/s, ES=0.0108, L=5.3704, SIG=53.60, grad=618.522]sequential epoch 005/350:  24%|██▎       | 242/1024 [00:25<01:22,  9.53it/s, ES=0.0088, L=5.3982, SIG=53.89, grad=616.585]sequential epoch 005/350:  28%|██▊       | 290/1024 [00:30<01:17,  9.45it/s, ES=0.0077, L=5.2916, SIG=52.84, grad=671.398]sequential epoch 005/350:  33%|███▎      | 338/1024 [00:35<01:12,  9.41it/s, ES=0.0070, L=5.4287, SIG=54.22, grad=630.855]sequential epoch 005/350:  38%|███▊      | 387/1024 [00:40<01:07,  9.49it/s, ES=0.0119, L=5.3500, SIG=53.38, grad=612.967]sequential epoch 005/350:  42%|████▏     | 435/1024 [00:45<01:02,  9.47it/s, ES=0.0087, L=5.4557, SIG=54.47, grad=600.822]sequential epoch 005/350:  47%|████▋     | 486/1024 [00:50<00:55,  9.65it/s, ES=0.0077, L=5.3555, SIG=53.48, grad=639.510]sequential epoch 005/350:  52%|█████▏    | 535/1024 [00:56<00:51,  9.57it/s, ES=0.0095, L=5.2707, SIG=52.61, grad=619.930]sequential epoch 005/350:  57%|█████▋    | 583/1024 [01:01<00:46,  9.50it/s, ES=0.0108, L=5.3140, SIG=53.03, grad=643.512]sequential epoch 005/350:  62%|██████▏   | 632/1024 [01:06<00:40,  9.58it/s, ES=0.0087, L=5.3025, SIG=52.94, grad=634.128]
