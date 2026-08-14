@@ -164,10 +164,10 @@ class BayesTransportConfig:
 
     # Heterogeneous training-task distribution.  Arrays are padded to these maxima,
     # while masks ensure that inactive source/coordinate slots never enter an embedder.
-    min_num_sources: int = 1
-    max_num_sources: int = 8
-    min_source_dim: int = 1
-    max_source_dim: int = 8
+    min_num_sources: int = 2
+    max_num_sources: int = 2
+    min_source_dim: int = 2
+    max_source_dim: int = 2
 
     # TAMO-style dimension aggregation.  Every observation pair and every theta particle
     # is mapped to one fixed E-vector before posterior conditioning/transport.  The hard
@@ -205,7 +205,7 @@ class BayesTransportConfig:
     mlp_ratio: int = 4
     posterior_depth: int = 6
     max_embedding_displacement: float = 6.0
-    canonicalize_particle_sources: bool = False
+    canonicalize_particle_sources: bool = True
 
     # Observation normalisation.
     y_center: float = 0.0
@@ -213,11 +213,11 @@ class BayesTransportConfig:
 
     # Optimisation.  The proper-score term is the mean EMBEDDING-space energy score
     # over B x T.  SIGReg is optional anti-collapse regularisation for theta embeddings.
-    epochs: int = 350
-    learning_rate: float = 1e-5
+    epochs: int = 150
+    learning_rate: float = 1e-6
     weight_decay: float = 1e-4
     # grad_clip_norm: float = 10.0
-    sigreg_weight: float = 0.1              # set to 0.0 to disable
+    sigreg_weight: float = 0.01              # set to 0.0 to disable
     sigreg_knots: int = 17
     sigreg_num_proj: int = 1024
     sigreg_t_max: float = 3.0
@@ -230,7 +230,7 @@ class BayesTransportConfig:
     decoder_epochs: int = 10000
     decoder_learning_rate: float = 1e-4
     decoder_batch_size: int = 128
-    decoder_train_samples: int = 8192
+    decoder_train_samples: int = 4096
     decoder_permutation_invariant_loss: bool = False
     decoder_plateau_eval_samples: int = 256
     decoder_plateau_patience: int = 500
@@ -1171,6 +1171,7 @@ class ThetaDimensionEmbedder(eqx.Module):
     prior_std: float = eqx.field(static=True)
     canonicalize: bool = eqx.field(static=True)
 
+
     def __init__(self, cfg: BayesTransportConfig, *, key: Array):
         keys = jax.random.split(key, cfg.dimension_embedder_depth + 3)
         E = cfg.embedding_dim
@@ -1231,6 +1232,14 @@ class ThetaDimensionEmbedder(eqx.Module):
             * self.coordinate_position_pool[coordinate_index]
         )
         return _masked_mean(tokens * positions, valid)
+
+    # def __call__(self, theta: Array, num_sources: Array, theta_size: Array) -> Array:
+    #     """Identity theta embedding, zero-padded to the original embedding dimension."""
+    #     theta_flat = theta.reshape(-1)
+    #     embedding_dim = self.source_position_pool.shape[-1]
+
+    #     return jnp.pad(theta_flat, (0, embedding_dim - theta_flat.shape[0]))
+
 
 
 #%% 6) Causal likelihood/context Transformer and cross-attention particle block
