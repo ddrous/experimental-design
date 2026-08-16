@@ -33,7 +33,7 @@ independently maps padded source coordinates theta -> R^E.
 At every sequential step the simulator provides Omax candidate design-outcome pairs.  A
 causal LikelihoodSequenceEmbedder contextualises the full Omax pair sequence once, with
 each output token attending only to itself and earlier pairs.  Training samples ONE active
-prefix length o in [1,Omax] when each minibatch is formed and uses that same o at EVERY
+prefix length o in [Omin,Omax] when each minibatch is formed and uses that same o at EVERY
 sequential step in that minibatch; validation/test-time can fix o through
 test_observations_per_step.  The Posterior Transformer first self-attends across particle
 tokens, then cross-attends only to the first o causal observation-memory tokens.
@@ -81,8 +81,10 @@ Training trajectories are refreshed continuously by an infinite PyTorch Iterable
 and DataLoader.  Every gradient step therefore receives fresh theta_true, designs, noisy
 observations, and a fresh prior point cloud from the same trajectory-specific prior law.
 The neural model itself still never calls the likelihood; simulation remains host-side.
-Validation trajectories stay fixed for comparable learning curves, and the known likelihood
-is used again only in an OPTIONAL reference-posterior diagnostic after training.
+Validation trajectories stay fixed on the seen (S,D) combinations for comparable learning
+curves.  After training, a separate balanced evaluation covers every configured (S,D),
+including combinations deliberately omitted from training, and may use a longer sequence.
+The known likelihood is used again only in an OPTIONAL reference-posterior diagnostic.
 """
 from __future__ import annotations
 
@@ -90,13 +92,15 @@ from dataclasses import asdict, dataclass
 import datetime
 import json
 import math
+import itertools
 from pathlib import Path
 import time
 from typing import Any
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
+from matplotlib.patches import FancyBboxPatch, FancyArrowPatch, Ellipse
+from matplotlib.colors import LogNorm
 from IPython.display import display
 from tqdm.auto import tqdm
 import yaml
@@ -157,10 +161,13 @@ class BayesTransportConfig:
 
     # Heterogeneous training-task distribution.  Arrays are padded to these maxima,
     # while masks ensure that inactive source/coordinate slots never enter an embedder.
-    min_num_sources: int = 2
-    max_num_sources: int = 2
-    min_source_dim: int = 2
-    max_source_dim: int = 2
+    # The listed held-out combinations are NEVER sampled by the training stream; they are
+    # reserved for the balanced dimensional-generalisation evaluation after training.
+    min_num_sources: int = 1
+    max_num_sources: int = 6
+    min_source_dim: int = 1
+    max_source_dim: int = 6
+    heldout_shapes: tuple[tuple[int, int], ...] = ((1, 6), (6, 1), (3, 3), (6, 6))
 
     # TAMO-style dimension aggregation.  Every observation pair and every theta particle
     # is mapped to one fixed E-vector before posterior conditioning/transport.  The hard
@@ -171,17 +178,24 @@ class BayesTransportConfig:
     embedding_heads: int = 8
 
     # Mode-A trajectory and particle counts.  Each sequential posterior update may consume
-    # between 1 and max_observations_per_step fresh design-outcome pairs.  Training samples
-    # ONE count when a minibatch is formed and uses that same count at every sequential step;
-    # test_observations_per_step fixes it for validation, physical visualisation, and all
-    # deterministic test diagnostics.
-    trajectory_length: int = 16
-    max_observations_per_step: int = 4
-    test_observations_per_step: int = 4
-    num_particles: int = 64
+    # between min_observations_per_step and max_observations_per_step fresh design-outcome
+    # pairs.  Training samples ONE count in [Omin,Omax] when a minibatch is formed and uses that same count
+    # at every sequential step; test_observations_per_step fixes it for validation, physical
+    # visualisation, and deterministic diagnostics.
+    trajectory_length: int = 8
+    min_observations_per_step: int = 4
+    max_observations_per_step: int = 8
+    test_observations_per_step: int = 6
+    num_particles: int = 32
     n_train_trajectories: int = 4096
     n_eval_trajectories: int = 256
-    batch_size: int = 4
+    batch_size: int = 8
+
+    # Balanced post-training dimensional-generalisation evaluation.  This is deliberately
+    # separate from the fixed validation set used for model selection, so evaluation can
+    # run for longer than the training horizon without changing training behaviour.
+    evaluation_trajectory_length: int = 64
+    n_evaluation_trajectories_per_shape: int = 16
 
     # Continuous host-side simulator stream.  n_train_trajectories now means the number of
     # FRESH trajectories consumed per nominal epoch; batch_size and all model hyperparameters
@@ -206,10 +220,10 @@ class BayesTransportConfig:
 
     # Optimisation. The proper-score term is the mean PHYSICAL-theta energy score
     # over B x T. The theta encoder is trained end-to-end through the same objective.
-    epochs: int = 150
-    learning_rate: float = 1e-6
+    epochs: int = 50
+    learning_rate: float = 1e-5
     weight_decay: float = 1e-4
-    # grad_clip_norm: float = 10.0
+    grad_clip_norm: float = 1000.0
 
     # Persistence / visualisation cadence.
     save_every_epochs: int = 10
@@ -252,12 +266,29 @@ def validate_config(cfg: BayesTransportConfig):
         raise ValueError("hidden_dim must be divisible by heads.")
     if cfg.embedding_dim % cfg.heads != 0:
         raise ValueError("embedding_dim must be divisible by heads for posterior cross-attention.")
-    if cfg.max_observations_per_step < 1:
-        raise ValueError("max_observations_per_step must be >= 1.")
-    if not (1 <= cfg.test_observations_per_step <= cfg.max_observations_per_step):
+    if cfg.min_observations_per_step < 1:
+        raise ValueError("min_observations_per_step must be >= 1.")
+    if cfg.max_observations_per_step < cfg.min_observations_per_step:
+        raise ValueError("max_observations_per_step must be >= min_observations_per_step.")
+    if not (cfg.min_observations_per_step <= cfg.test_observations_per_step <= cfg.max_observations_per_step):
         raise ValueError(
-            "test_observations_per_step must lie in [1, max_observations_per_step]."
+            "test_observations_per_step must lie in "
+            "[min_observations_per_step, max_observations_per_step]."
         )
+    if cfg.evaluation_trajectory_length < 1:
+        raise ValueError("evaluation_trajectory_length must be >= 1.")
+    if cfg.n_evaluation_trajectories_per_shape < 1:
+        raise ValueError("n_evaluation_trajectories_per_shape must be >= 1.")
+    all_shapes = {
+        (s, d)
+        for s in range(cfg.min_num_sources, cfg.max_num_sources + 1)
+        for d in range(cfg.min_source_dim, cfg.max_source_dim + 1)
+    }
+    heldout = {tuple(map(int, shape)) for shape in cfg.heldout_shapes}
+    if not heldout.issubset(all_shapes):
+        raise ValueError("Every heldout_shapes entry must lie inside the configured S,D ranges.")
+    if heldout == all_shapes:
+        raise ValueError("heldout_shapes cannot remove every training shape.")
     if cfg.meta_prior_min_components < 1:
         raise ValueError("meta_prior_min_components must be >= 1.")
     if cfg.meta_prior_max_components < cfg.meta_prior_min_components:
@@ -300,10 +331,22 @@ else:
     for _tuple_field in ("particle_limit_values", "trajectory_mc_values"):
         if _tuple_field in _saved_cfg_dict:
             _saved_cfg_dict[_tuple_field] = tuple(_saved_cfg_dict[_tuple_field])
+    if "heldout_shapes" in _saved_cfg_dict:
+        _saved_cfg_dict["heldout_shapes"] = tuple(
+            tuple(map(int, shape)) for shape in _saved_cfg_dict["heldout_shapes"]
+        )
     CFG = BayesTransportConfig(**_saved_cfg_dict)
 
 
 validate_config(CFG)
+
+ALL_SHAPES = tuple(
+    (s, d)
+    for s in range(CFG.min_num_sources, CFG.max_num_sources + 1)
+    for d in range(CFG.min_source_dim, CFG.max_source_dim + 1)
+)
+HELDOUT_SHAPES = tuple(shape for shape in CFG.heldout_shapes if shape in ALL_SHAPES)
+TRAIN_SHAPES = tuple(shape for shape in ALL_SHAPES if shape not in HELDOUT_SHAPES)
 
 #%% 2) Run directories and small persistence helpers
 def make_run_dir(env_name: str, base: str | Path = "./runs") -> Path:
@@ -519,26 +562,52 @@ def _sample_problem_shapes_np(
     *,
     fixed_num_sources: int | None = None,
     fixed_source_dim: int | None = None,
+    shape_pool: tuple[tuple[int, int], ...] | None = None,
+    balanced_shapes: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Sample S and theta_size=S*D; D is intentionally derivable from those two."""
-    if fixed_num_sources is None:
-        num_sources = rng.integers(
-            cfg.min_num_sources, cfg.max_num_sources + 1, size=int(n), dtype=np.int32
-        )
-    else:
-        num_sources = np.full(int(n), int(fixed_num_sources), dtype=np.int32)
+    """Sample S and theta_size=S*D from an explicit set of allowed problem shapes.
 
-    if fixed_source_dim is None:
-        source_dim = rng.integers(
-            cfg.min_source_dim, cfg.max_source_dim + 1, size=int(n), dtype=np.int32
+    With no `shape_pool`, the training pool is the full configured S,D grid minus the
+    held-out combinations.  `balanced_shapes=True` cycles through the pool before shuffling,
+    which is useful for validation/test grids; the continuous training stream samples shapes
+    randomly from the same pool.  Fixed S or D constraints are applied after choosing the pool.
+    """
+    if shape_pool is None:
+        heldout = {tuple(map(int, shape)) for shape in cfg.heldout_shapes}
+        # Unconstrained sampling is the training distribution and excludes held-out shapes.
+        # Explicit fixed-shape diagnostics are allowed anywhere inside the configured grid.
+        include_heldout = fixed_num_sources is not None or fixed_source_dim is not None
+        shape_pool = tuple(
+            (s, d)
+            for s in range(cfg.min_num_sources, cfg.max_num_sources + 1)
+            for d in range(cfg.min_source_dim, cfg.max_source_dim + 1)
+            if include_heldout or (s, d) not in heldout
         )
-    else:
-        source_dim = np.full(int(n), int(fixed_source_dim), dtype=np.int32)
 
+    candidates = [
+        (int(s), int(d))
+        for s, d in shape_pool
+        if (fixed_num_sources is None or int(s) == int(fixed_num_sources))
+        and (fixed_source_dim is None or int(d) == int(fixed_source_dim))
+    ]
+    if not candidates:
+        raise ValueError("No problem shapes remain after applying the requested constraints.")
+
+    if balanced_shapes:
+        chosen = np.asarray([candidates[i % len(candidates)] for i in range(int(n))], dtype=np.int32)
+        rng.shuffle(chosen)
+    else:
+        chosen = np.asarray(
+            [candidates[i] for i in rng.integers(0, len(candidates), size=int(n))],
+            dtype=np.int32,
+        )
+
+    num_sources = chosen[:, 0]
+    source_dim = chosen[:, 1]
     theta_size = (num_sources * source_dim).astype(np.int32)
     if np.any(theta_size > cfg.embedding_dim):
         raise ValueError("Sampled theta_size exceeds embedding_dim; validate CFG ranges.")
-    return num_sources, theta_size
+    return num_sources.astype(np.int32), theta_size
 
 
 def _prior_spec_from_dataset_row(
@@ -584,6 +653,8 @@ def simulate_trajectories(
     *,
     fixed_num_sources: int | None = None,
     fixed_source_dim: int | None = None,
+    shape_pool: tuple[tuple[int, int], ...] | None = None,
+    balanced_shapes: bool = False,
 ) -> dict[str, np.ndarray]:
     """Generate complete heterogeneous Mode-A trajectories.
 
@@ -618,6 +689,8 @@ def simulate_trajectories(
         cfg,
         fixed_num_sources=fixed_num_sources,
         fixed_source_dim=fixed_source_dim,
+        shape_pool=shape_pool,
+        balanced_shapes=balanced_shapes,
     )
 
     theta_true = np.zeros(
@@ -696,7 +769,7 @@ def make_batch_np(
     single-Gaussian experiment and the optional Gaussian-mixture meta-prior experiment.
 
     Every stored sequential step contains Omax candidate observations.  With
-    `observations_per_step=None`, this minibatch samples ONE integer o in [1,Omax] and uses
+    `observations_per_step=None`, this minibatch samples ONE integer o in [Omin,Omax] and uses
     that same prefix length for every sequential step and every trajectory in the batch.
     Passing an integer fixes o, which is used for reproducible validation/test-time and
     physical posterior visualisations.
@@ -741,13 +814,15 @@ def make_batch_np(
     # while keeping one forward scan internally homogeneous.
     if observations_per_step is None:
         observation_count = np.asarray(
-            rng.integers(1, cfg.max_observations_per_step + 1), dtype=np.int32
+            rng.integers(cfg.min_observations_per_step, cfg.max_observations_per_step + 1), dtype=np.int32
         )
     else:
         fixed_count = int(observations_per_step)
-        if not (1 <= fixed_count <= cfg.max_observations_per_step):
+        # print(f"Using fixed observations_per_step={fixed_count} for this batch.")
+        if not (cfg.min_observations_per_step <= fixed_count <= cfg.max_observations_per_step):
             raise ValueError(
-                "observations_per_step must lie in [1, max_observations_per_step]."
+                "observations_per_step must lie in "
+                "[min_observations_per_step, max_observations_per_step]."
             )
         observation_count = np.asarray(fixed_count, dtype=np.int32)
 
@@ -855,7 +930,7 @@ class ContinuousTrajectoryDataset(IterableDataset):
                 np.asarray([0], dtype=np.int64),
                 rng,
                 self.cfg,
-                observations_per_step=1,  # training chooses the real batch-level count below
+                observations_per_step=self.cfg.min_observations_per_step,  # training chooses the real batch-level count below
             )
             yield {
                 name: np.asarray(value[0])
@@ -2105,76 +2180,57 @@ def plot_training_diagnostics(
 ):
     steps = np.arange(1, len(history["step_loss"]) + 1)
     epochs = np.arange(1, len(history["epoch_train_loss"]) + 1)
-    fig, axes = plt.subplots(2, 2, figsize=(12.5, 9.0), constrained_layout=True)
+    fig, axes = plt.subplots(2, 3, figsize=(16.5, 9.0), constrained_layout=True)
 
-    values = np.asarray(history["step_loss"])
-    axes[0, 0].plot(steps, values, linewidth=0.70, alpha=0.65, label="physical energy score")
+    values = np.maximum(np.asarray(history["step_loss"], dtype=float), 1e-12)
+    axes[0, 0].plot(steps, values, linewidth=0.70, alpha=0.60, label="physical energy score")
     if len(values) >= 20:
         window = max(5, len(values) // 100)
         smoothed = np.convolve(values, np.ones(window) / window, mode="valid")
-        axes[0, 0].plot(
-            steps[window - 1:],
-            smoothed,
-            linewidth=1.8,
-            label=f"moving average ({window})",
-            color="C0",
-        )
+        axes[0, 0].plot(steps[window - 1:], smoothed, linewidth=1.8, label=f"moving average ({window})")
     axes[0, 0].set_title("Physical-theta loss at every gradient step", loc="left", fontweight="bold")
     axes[0, 0].set_xlabel("gradient step")
-    axes[0, 0].set_yscale("symlog", linthresh=1e-5)
+    axes[0, 0].set_yscale("log")
     axes[0, 0].grid(alpha=0.2)
     axes[0, 0].legend(fontsize=8)
 
-    axes[0, 1].plot(steps, history["step_grad_norm"], linewidth=0.75)
-    axes[0, 1].set_title("Gradient norm at every step", loc="left", fontweight="bold")
+    rmse = np.maximum(np.asarray(history["step_mean_rmse"], dtype=float), 1e-12)
+    axes[0, 1].plot(steps, rmse, linewidth=0.75)
+    axes[0, 1].set_title("Posterior-mean RMSE at every gradient step", loc="left", fontweight="bold")
     axes[0, 1].set_xlabel("gradient step")
     axes[0, 1].set_yscale("log")
     axes[0, 1].grid(alpha=0.2)
 
-    axes[1, 0].plot(
-        epochs, history["epoch_train_loss"], marker="o", markersize=3, label="train"
-    )
-    axes[1, 0].plot(
-        epochs, history["epoch_val_loss"], marker="o", markersize=3, label="validation"
-    )
-    axes[1, 0].axvline(
-        best_epoch, linestyle="--", linewidth=1.0, label=f"best epoch {best_epoch}"
-    )
+    axes[0, 2].plot(steps, history["step_grad_norm"], linewidth=0.75)
+    axes[0, 2].set_title("Gradient norm at every step", loc="left", fontweight="bold")
+    axes[0, 2].set_xlabel("gradient step")
+    axes[0, 2].grid(alpha=0.2)
+
+    axes[1, 0].plot(epochs, np.maximum(history["epoch_train_loss"], 1e-12), marker="o", markersize=3, label="train")
+    axes[1, 0].plot(epochs, np.maximum(history["epoch_val_loss"], 1e-12), marker="o", markersize=3, label="validation")
+    axes[1, 0].axvline(best_epoch, linestyle="--", linewidth=1.0, label=f"best epoch {best_epoch}")
     axes[1, 0].set_title("Per-epoch physical energy score", loc="left", fontweight="bold")
     axes[1, 0].set_xlabel("epoch")
     axes[1, 0].set_yscale("log")
     axes[1, 0].grid(alpha=0.2)
     axes[1, 0].legend(fontsize=8)
 
-    energy_by_t = np.asarray(history["epoch_val_energy_by_t"])
-    selected_epochs = np.unique(
-        np.clip(
-            np.rint(np.linspace(0, len(energy_by_t) - 1, 5)).astype(int),
-            0,
-            len(energy_by_t) - 1,
-        )
-    )
+    energy_by_t = np.asarray(history["epoch_val_energy_by_t"], dtype=float)
+    rmse_by_t = np.asarray(history["epoch_val_rmse_by_t"], dtype=float)
+    selected_epochs = np.unique(np.clip(np.rint(np.linspace(0, len(energy_by_t) - 1, 5)).astype(int), 0, len(energy_by_t) - 1))
     prefix_axis = np.arange(1, energy_by_t.shape[1] + 1)
     for epoch_index in selected_epochs:
-        axes[1, 1].plot(
-            prefix_axis,
-            energy_by_t[epoch_index],
-            label=f"epoch {epoch_index + 1}",
-        )
-    axes[1, 1].set_title(
-        "Validation physical energy score by prefix",
-        loc="left",
-        fontweight="bold",
-    )
-    axes[1, 1].set_xlabel("sequential step t")
-    axes[1, 1].grid(alpha=0.2)
-    axes[1, 1].legend(fontsize=8)
+        axes[1, 1].plot(prefix_axis, np.maximum(energy_by_t[epoch_index], 1e-12), label=f"epoch {epoch_index + 1}")
+        axes[1, 2].plot(prefix_axis, np.maximum(rmse_by_t[epoch_index], 1e-12), label=f"epoch {epoch_index + 1}")
+    axes[1, 1].set_title("Validation energy score by prefix", loc="left", fontweight="bold")
+    axes[1, 2].set_title("Validation RMSE by prefix", loc="left", fontweight="bold")
+    for ax in axes[1, 1:]:
+        ax.set_xlabel("sequential step t")
+        ax.set_yscale("log")
+        ax.grid(alpha=0.2)
+        ax.legend(fontsize=8)
 
-    fig.suptitle(
-        "Mode-A dimension-agnostic sequential training diagnostics",
-        fontsize=14,
-        fontweight="bold",
-    )
+    fig.suptitle("Mode-A dimension-agnostic sequential training diagnostics", fontsize=14, fontweight="bold")
     if destination is not None:
         fig.savefig(destination, dpi=170)
     display(fig)
@@ -2206,7 +2262,7 @@ def train_model(
     print("\nsequential cross-attention")
     print_model_parameter_count(model)
     optimizer = optax.chain(
-        # optax.clip_by_global_norm(cfg.grad_clip_norm),
+        optax.clip_by_global_norm(cfg.grad_clip_norm),
         optax.adamw(learning_rate=cfg.learning_rate, weight_decay=cfg.weight_decay),
     )
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
@@ -2286,7 +2342,9 @@ def train_model(
             # The next minibatch samples a fresh value, so training covers downstream calls
             # with different numbers of observations without varying o inside one scan.
             batch_np["observation_count"] = np.asarray(
-                observation_count_rng.integers(1, cfg.max_observations_per_step + 1),
+                observation_count_rng.integers(
+                    cfg.min_observations_per_step, cfg.max_observations_per_step + 1
+                ),
                 dtype=np.int32,
             )
             batch = {name: jnp.asarray(value) for name, value in batch_np.items()}
@@ -2350,6 +2408,7 @@ def train_model(
                 "best_val_loss": best_val_loss,
                 "elapsed_seconds": time.time() - training_started_at,
                 "objective": "mean physical-theta energy score over B x T",
+                "min_observations_per_step": cfg.min_observations_per_step,
                 "max_observations_per_step": cfg.max_observations_per_step,
                 "test_observations_per_step": cfg.test_observations_per_step,
             },
@@ -2424,7 +2483,8 @@ if train_wm:
     train_loader = make_continuous_train_loader(CFG, seed=CFG.seed + 1_000)
     eval_rng = np.random.default_rng(CFG.seed + 2_000)
     eval_data = simulate_trajectories(
-        eval_rng, CFG.n_eval_trajectories, CFG.trajectory_length, CFG
+        eval_rng, CFG.n_eval_trajectories, CFG.trajectory_length, CFG,
+        shape_pool=TRAIN_SHAPES, balanced_shapes=True,
     )
 
     prior_mode = (
@@ -2435,8 +2495,9 @@ if train_wm:
     print("Continuous training stream:")
     print(f"  fresh trajectories per nominal epoch: {CFG.n_train_trajectories}")
     print(f"  batch size (unchanged): {CFG.batch_size}")
-    print(f"  S uniformly sampled in [{CFG.min_num_sources}, {CFG.max_num_sources}]")
-    print(f"  D uniformly sampled in [{CFG.min_source_dim}, {CFG.max_source_dim}]")
+    print(f"  S,D grid: [{CFG.min_num_sources},{CFG.max_num_sources}] x [{CFG.min_source_dim},{CFG.max_source_dim}]")
+    print(f"  held-out training shapes: {HELDOUT_SHAPES}")
+    print(f"  training shapes: {len(TRAIN_SHAPES)} / {len(ALL_SHAPES)} combinations")
     print(f"  t=0 prior mode: {prior_mode}")
 
     # Keep one fixed 2-D problem for physical posterior plots. It is generated separately
@@ -2486,7 +2547,8 @@ else:
     # the original saved configuration for fresh diagnostics without needing the train stream.
     eval_rng = np.random.default_rng(CFG.seed + 2_000)
     eval_data = simulate_trajectories(
-        eval_rng, CFG.n_eval_trajectories, CFG.trajectory_length, CFG
+        eval_rng, CFG.n_eval_trajectories, CFG.trajectory_length, CFG,
+        shape_pool=TRAIN_SHAPES, balanced_shapes=True,
     )
 
     fixed_path = run_dir / "artefacts" / "fixed_trajectory.npz"
@@ -2579,6 +2641,304 @@ plot_posterior_evolution(
     CFG,
     run_dir / "plots" / "fixed_trajectory_best_model.png",
     "sequential cross-attention: direct physical posterior evolution",
+)
+
+#%% 19c) Balanced dimensional-generalisation evaluation, including held-out S,D shapes
+def evaluate_dimension_generalisation(
+    model: SequentialBayesModel,
+    dataset: dict[str, np.ndarray],
+    cfg: BayesTransportConfig = CFG,
+    *,
+    seed: int,
+) -> dict[str, np.ndarray]:
+    """Evaluate every trajectory individually so errors can be grouped by (S,D).
+
+    This uses the same physical energy score and RMSE as training, but stores the final
+    posterior particles and per-prefix metrics so dimensional generalisation can be inspected
+    rather than reduced to one scalar.  The input dataset is balanced across ALL_SHAPES.
+    """
+    rng = np.random.default_rng(seed)
+    final_particles, final_means, compact_targets = [], [], []
+    energy_rows, rmse_rows, spread_rows = [], [], []
+
+    for start in range(0, len(dataset["theta_true"]), cfg.batch_size):
+        stop = min(start + cfg.batch_size, len(dataset["theta_true"]))
+        indices = np.arange(start, stop)
+        batch_np = make_batch_np(
+            dataset,
+            indices,
+            rng,
+            cfg,
+            observations_per_step=cfg.test_observations_per_step,
+        )
+        batch = {name: jnp.asarray(value) for name, value in batch_np.items()}
+        predicted, _, _ = predict_batch(
+            model,
+            batch["prior_particles"],
+            batch["observations"],
+            batch["observation_count"],
+            batch["num_sources"],
+            batch["theta_size"],
+        )
+        targets = batch["theta_true"]
+        if cfg.canonicalize_particle_sources:
+            targets = jax.vmap(canonicalize_padded_sources_jax)(targets, batch["num_sources"])
+        targets = jax.vmap(compact_theta_jax)(targets, batch["num_sources"], batch["theta_size"])
+        energy, rmse, spread = jax.vmap(_trajectory_metrics)(predicted, targets, batch["theta_size"])
+
+        predicted_np = np.asarray(jax.device_get(predicted), dtype=np.float32)
+        final = predicted_np[:, -1]
+        final_particles.append(final)
+        final_means.append(final.mean(axis=1))
+        compact_targets.append(np.asarray(jax.device_get(targets), dtype=np.float32))
+        energy_rows.append(np.asarray(jax.device_get(energy), dtype=np.float64))
+        rmse_rows.append(np.asarray(jax.device_get(rmse), dtype=np.float64))
+        spread_rows.append(np.asarray(jax.device_get(spread), dtype=np.float64))
+
+    final_particles = np.concatenate(final_particles, axis=0)
+    final_means = np.concatenate(final_means, axis=0)
+    compact_targets = np.concatenate(compact_targets, axis=0)
+    energy_by_t = np.concatenate(energy_rows, axis=0)
+    rmse_by_t = np.concatenate(rmse_rows, axis=0)
+    spread_by_t = np.concatenate(spread_rows, axis=0)
+    num_sources = np.asarray(dataset["num_sources"], dtype=np.int32)
+    source_dim = np.asarray(dataset["theta_size"] // dataset["num_sources"], dtype=np.int32)
+    heldout = np.asarray([(int(s), int(d)) in HELDOUT_SHAPES for s, d in zip(num_sources, source_dim)])
+
+    rmse_grid = np.full((cfg.max_num_sources, cfg.max_source_dim), np.nan)
+    energy_grid = np.full_like(rmse_grid, np.nan)
+    spread_grid = np.full_like(rmse_grid, np.nan)
+    shape_rmse_by_t = np.full((cfg.max_num_sources, cfg.max_source_dim, rmse_by_t.shape[1]), np.nan)
+    shape_energy_by_t = np.full_like(shape_rmse_by_t, np.nan)
+    rows = []
+    for s, d in ALL_SHAPES:
+        select = (num_sources == s) & (source_dim == d)
+        rmse_grid[s - 1, d - 1] = np.mean(rmse_by_t[select, -1])
+        energy_grid[s - 1, d - 1] = np.mean(energy_by_t[select, -1])
+        spread_grid[s - 1, d - 1] = np.mean(spread_by_t[select, -1])
+        shape_rmse_by_t[s - 1, d - 1] = np.mean(rmse_by_t[select], axis=0)
+        shape_energy_by_t[s - 1, d - 1] = np.mean(energy_by_t[select], axis=0)
+        rows.append((s, d, int((s, d) in HELDOUT_SHAPES), int(np.sum(select)),
+                     rmse_grid[s - 1, d - 1], energy_grid[s - 1, d - 1], spread_grid[s - 1, d - 1]))
+
+    np.savetxt(
+        run_dir / "artefacts" / "dimensional_generalisation_by_shape.csv",
+        np.asarray(rows, dtype=float),
+        delimiter=",",
+        header="S,D,heldout,n,final_rmse,final_energy,final_spread",
+        comments="",
+    )
+    return {
+        "num_sources": num_sources,
+        "source_dim": source_dim,
+        "heldout": heldout,
+        "final_particles": final_particles,
+        "final_means": final_means,
+        "targets": compact_targets,
+        "energy_by_t": energy_by_t,
+        "rmse_by_t": rmse_by_t,
+        "spread_by_t": spread_by_t,
+        "rmse_grid": rmse_grid,
+        "energy_grid": energy_grid,
+        "spread_grid": spread_grid,
+        "shape_rmse_by_t": shape_rmse_by_t,
+        "shape_energy_by_t": shape_energy_by_t,
+    }
+
+
+def plot_dimension_generalisation(
+    study: dict[str, np.ndarray],
+    dataset: dict[str, np.ndarray],
+    cfg: BayesTransportConfig = CFG,
+):
+    """Benchmark-style shape diagnostics plus source-identification views."""
+    rmse_grid = study["rmse_grid"]
+    energy_grid = study["energy_grid"]
+
+    # Benchmark-style summary: shape heatmaps, true-vs-posterior-mean scatter, and difficulty.
+    fig, axes = plt.subplots(2, 2, figsize=(13.5, 10.5), constrained_layout=True)
+    for ax, grid, title, label in (
+        (axes[0, 0], rmse_grid, "Final posterior-mean RMSE by shape", "RMSE"),
+        (axes[0, 1], energy_grid, "Final energy score by shape", "energy score"),
+    ):
+        positive = grid[np.isfinite(grid) & (grid > 0)]
+        norm = LogNorm(vmin=max(float(np.min(positive)), 1e-8), vmax=max(float(np.max(positive)), float(np.min(positive)) * 1.0001))
+        im = ax.imshow(grid, origin="lower", aspect="auto", norm=norm)
+        ax.set_xticks(np.arange(cfg.max_source_dim), np.arange(1, cfg.max_source_dim + 1))
+        ax.set_yticks(np.arange(cfg.max_num_sources), np.arange(1, cfg.max_num_sources + 1))
+        ax.set_xlabel("source dimension D")
+        ax.set_ylabel("number of sources S")
+        ax.set_title(title, fontweight="bold")
+        fig.colorbar(im, ax=ax, label=label)
+        for s, d in HELDOUT_SHAPES:
+            ax.text(d - 1, s - 1, "H", ha="center", va="center", fontweight="bold", fontsize=11,
+                    bbox=dict(boxstyle="circle,pad=0.18", facecolor="white", alpha=0.75, edgecolor="none"))
+
+    active_true, active_pred = [], []
+    for i, theta_size in enumerate(dataset["theta_size"]):
+        k = int(theta_size)
+        active_true.append(study["targets"][i, :k])
+        active_pred.append(study["final_means"][i, :k])
+    active_true = np.concatenate(active_true)
+    active_pred = np.concatenate(active_pred)
+    axes[1, 0].scatter(active_true, active_pred, s=7, alpha=0.14)
+    lo = float(min(active_true.min(), active_pred.min()))
+    hi = float(max(active_true.max(), active_pred.max()))
+    axes[1, 0].plot([lo, hi], [lo, hi], linestyle="--", linewidth=1.0)
+    axes[1, 0].set_xlabel("true active theta coordinate")
+    axes[1, 0].set_ylabel("final posterior-mean coordinate")
+    axes[1, 0].set_title("All active coordinates", fontweight="bold")
+    axes[1, 0].grid(alpha=0.2)
+
+    shape_size, shape_rmse, is_heldout = [], [], []
+    for s, d in ALL_SHAPES:
+        shape_size.append(s * d)
+        shape_rmse.append(rmse_grid[s - 1, d - 1])
+        is_heldout.append((s, d) in HELDOUT_SHAPES)
+    shape_size = np.asarray(shape_size)
+    shape_rmse = np.asarray(shape_rmse)
+    is_heldout = np.asarray(is_heldout)
+    axes[1, 1].scatter(shape_size[~is_heldout], shape_rmse[~is_heldout], alpha=0.75, label="seen shape")
+    axes[1, 1].scatter(shape_size[is_heldout], shape_rmse[is_heldout], marker="X", s=90, label="held-out shape")
+    for (s, d), x, y, h in zip(ALL_SHAPES, shape_size, shape_rmse, is_heldout):
+        if h:
+            axes[1, 1].annotate(f"{s}x{d}", (x, y), xytext=(4, 4), textcoords="offset points", fontsize=8)
+    axes[1, 1].set_yscale("log")
+    axes[1, 1].set_xlabel("theta size S x D")
+    axes[1, 1].set_ylabel("final RMSE")
+    axes[1, 1].set_title("Difficulty versus active theta size", fontweight="bold")
+    axes[1, 1].grid(alpha=0.2)
+    axes[1, 1].legend(fontsize=8)
+    fig.suptitle("Dimensional generalisation: seen versus deliberately held-out shapes", fontsize=15, fontweight="bold")
+    fig.savefig(run_dir / "plots" / "dimensional_generalisation_summary.png", dpi=180)
+    display(fig); plt.close(fig)
+
+    # Benchmark-style fixed examples, now with posterior-particle uncertainty bands.
+    preferred = ((1, 1), (2, 2), (3, 2), (2, 4), (4, 1), (4, 4), (1, 6), (6, 1), (3, 3), (6, 6))
+    selected = []
+    for shape in preferred:
+        hits = np.flatnonzero((study["num_sources"] == shape[0]) & (study["source_dim"] == shape[1]))
+        if len(hits):
+            selected.append(int(hits[0]))
+    fig, axes = plt.subplots(len(selected), 1, figsize=(12.5, 2.45 * len(selected)), constrained_layout=True)
+    axes = np.atleast_1d(axes)
+    for ax, idx in zip(axes, selected):
+        s = int(study["num_sources"][idx]); d = int(study["source_dim"][idx]); k = s * d
+        truth = study["targets"][idx, :k]
+        cloud = study["final_particles"][idx, :, :k]
+        mean = cloud.mean(axis=0)
+        q10, q90 = np.quantile(cloud, [0.10, 0.90], axis=0)
+        x = np.arange(k)
+        ax.fill_between(x, q10, q90, alpha=0.16, label="10-90% posterior particles")
+        ax.plot(x, truth, marker="o", linewidth=1.3, label="true theta")
+        ax.plot(x, mean, marker="x", linewidth=1.3, label="posterior mean")
+        ax.set_title(f"S={s}, D={d}" + ("  HELD OUT" if (s, d) in HELDOUT_SHAPES else ""), loc="left", fontweight="bold")
+        ax.set_ylabel("theta")
+        ax.grid(alpha=0.2)
+        ax.legend(ncol=3, fontsize=8)
+    axes[-1].set_xlabel("compact active theta coordinate")
+    fig.suptitle("Fixed dimensional-generalisation examples at the final evaluation step", fontsize=14, fontweight="bold")
+    fig.savefig(run_dir / "plots" / "dimensional_generalisation_fixed_examples.png", dpi=180)
+    display(fig); plt.close(fig)
+
+    # How quickly evidence is used: every shape as a faint line, with seen/held-out group means.
+    t = np.arange(1, study["rmse_by_t"].shape[1] + 1)
+    fig, axes = plt.subplots(1, 2, figsize=(14.2, 5.2), constrained_layout=True)
+    seen_curves_rmse, held_curves_rmse, seen_curves_es, held_curves_es = [], [], [], []
+    for s, d in ALL_SHAPES:
+        r = study["shape_rmse_by_t"][s - 1, d - 1]
+        e = study["shape_energy_by_t"][s - 1, d - 1]
+        held = (s, d) in HELDOUT_SHAPES
+        axes[0].plot(t, np.maximum(r, 1e-12), alpha=0.16, linewidth=0.9, linestyle="--" if held else "-")
+        axes[1].plot(t, np.maximum(e, 1e-12), alpha=0.16, linewidth=0.9, linestyle="--" if held else "-")
+        (held_curves_rmse if held else seen_curves_rmse).append(r)
+        (held_curves_es if held else seen_curves_es).append(e)
+    axes[0].plot(t, np.maximum(np.mean(seen_curves_rmse, axis=0), 1e-12), linewidth=2.5, label="seen-shape mean")
+    axes[0].plot(t, np.maximum(np.mean(held_curves_rmse, axis=0), 1e-12), linewidth=2.5, linestyle="--", label="held-out-shape mean")
+    axes[1].plot(t, np.maximum(np.mean(seen_curves_es, axis=0), 1e-12), linewidth=2.5, label="seen-shape mean")
+    axes[1].plot(t, np.maximum(np.mean(held_curves_es, axis=0), 1e-12), linewidth=2.5, linestyle="--", label="held-out-shape mean")
+    for ax, title, ylabel in zip(axes, ("Posterior-mean RMSE versus evidence", "Energy score versus evidence"), ("RMSE", "energy score")):
+        ax.axvline(cfg.trajectory_length, linestyle=":", linewidth=1.3, label="training horizon")
+        ax.set_yscale("log")
+        ax.set_xlabel("sequential step t")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title, fontweight="bold")
+        ax.grid(alpha=0.2)
+        ax.legend(fontsize=8)
+    fig.suptitle("Generalisation through a longer evaluation sequence", fontsize=14, fontweight="bold")
+    fig.savefig(run_dir / "plots" / "dimensional_generalisation_by_prefix.png", dpi=180)
+    display(fig); plt.close(fig)
+
+    # Source-identification gallery for the directly visualisable D=2 cases.  A best permutation
+    # is used ONLY for display because physical sources are exchangeable; it never changes a score.
+    fig, axes = plt.subplots(2, 3, figsize=(14.2, 9.2), constrained_layout=True)
+    for ax, s in zip(axes.ravel(), range(1, min(cfg.max_num_sources, 6) + 1)):
+        hits = np.flatnonzero((study["num_sources"] == s) & (study["source_dim"] == 2))
+        if not len(hits):
+            ax.axis("off"); continue
+        idx = int(hits[0]); k = 2 * s
+        truth = study["targets"][idx, :k].reshape(s, 2)
+        cloud = study["final_particles"][idx, :, :k].reshape(-1, s, 2)
+        mean = cloud.mean(axis=0)
+        best_perm = min(itertools.permutations(range(s)), key=lambda p: float(np.sum((mean[list(p)] - truth) ** 2)))
+        cloud = cloud[:, best_perm, :]
+        mean = cloud.mean(axis=0)
+        matched_rmse = float(np.sqrt(np.mean((mean - truth) ** 2)))
+        for source_index in range(s):
+            points = cloud[:, source_index]
+            ax.scatter(points[:, 0], points[:, 1], s=8, alpha=0.08, color=f"C{source_index % 10}")
+            covariance = np.cov(points.T)
+            eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+            eigenvalues = np.maximum(eigenvalues, 1e-12)
+            order = np.argsort(eigenvalues)[::-1]
+            eigenvalues = eigenvalues[order]; eigenvectors = eigenvectors[:, order]
+            angle = np.degrees(np.arctan2(eigenvectors[1, 0], eigenvectors[0, 0]))
+            ellipse = Ellipse(mean[source_index], 2 * np.sqrt(4.605 * eigenvalues[0]),
+                              2 * np.sqrt(4.605 * eigenvalues[1]), angle=angle,
+                              fill=False, linewidth=1.4, alpha=0.8, color=f"C{source_index % 10}")
+            ax.add_patch(ellipse)
+            ax.scatter(mean[source_index, 0], mean[source_index, 1], marker="x", s=65, color=f"C{source_index % 10}")
+            ax.scatter(truth[source_index, 0], truth[source_index, 1], marker="*", s=150,
+                       color=f"C{source_index % 10}", edgecolors="black", linewidths=0.6)
+            ax.plot([mean[source_index, 0], truth[source_index, 0]],
+                    [mean[source_index, 1], truth[source_index, 1]], linewidth=0.8,
+                    alpha=0.55, color=f"C{source_index % 10}")
+        ax.set_xlim(cfg.design_low, cfg.design_high); ax.set_ylim(cfg.design_low, cfg.design_high)
+        ax.set_aspect("equal"); ax.grid(alpha=0.2)
+        ax.set_title(f"S={s}, D=2 | matched RMSE={matched_rmse:.3f}", fontweight="bold")
+        ax.set_xlabel("x1"); ax.set_ylabel("x2")
+    fig.suptitle("Source identification: truth stars, posterior means, and 90% marginal ellipses\n(best source permutation used for display only)", fontsize=14, fontweight="bold")
+    fig.savefig(run_dir / "plots" / "source_identification_gallery.png", dpi=180)
+    display(fig); plt.close(fig)
+
+
+post_eval_rng = np.random.default_rng(CFG.seed + 120_000)
+post_eval_data = simulate_trajectories(
+    post_eval_rng,
+    CFG.n_evaluation_trajectories_per_shape * len(ALL_SHAPES),
+    CFG.evaluation_trajectory_length,
+    CFG,
+    shape_pool=ALL_SHAPES,
+    balanced_shapes=True,
+)
+dimensional_generalisation = evaluate_dimension_generalisation(
+    model, post_eval_data, CFG, seed=CFG.seed + 121_000
+)
+np.savez_compressed(
+    run_dir / "artefacts" / "dimensional_generalisation.npz",
+    **{name: np.asarray(value) for name, value in dimensional_generalisation.items()},
+)
+plot_dimension_generalisation(dimensional_generalisation, post_eval_data, CFG)
+
+seen = ~dimensional_generalisation["heldout"]
+held = dimensional_generalisation["heldout"]
+print(
+    "[dimensional generalisation] "
+    f"T_eval={CFG.evaluation_trajectory_length} | "
+    f"seen final RMSE={np.mean(dimensional_generalisation['rmse_by_t'][seen, -1]):.5f} | "
+    f"held-out final RMSE={np.mean(dimensional_generalisation['rmse_by_t'][held, -1]):.5f} | "
+    f"seen final ES={np.mean(dimensional_generalisation['energy_by_t'][seen, -1]):.5f} | "
+    f"held-out final ES={np.mean(dimensional_generalisation['energy_by_t'][held, -1]):.5f}"
 )
 
 #%% 20) Direct visual comparison with a likelihood-based posterior reference
@@ -2806,6 +3166,8 @@ axes[2].plot(n, particle_study["seconds"], marker="o")
 for ax in axes:
     ax.set_xscale("log", base=2)
     ax.grid(alpha=0.25)
+axes[0].set_yscale("log")
+axes[1].set_yscale("log")
 axes[0].set_title("Final-step energy score")
 axes[1].set_title("Final physical posterior-mean RMSE")
 axes[2].set_title("Evaluation wall time")
@@ -2848,6 +3210,8 @@ for ax in axes:
     ax.set_xlabel("sequential step t")
     ax.grid(alpha=0.25)
     ax.legend(fontsize=8)
+for ax in axes:
+    ax.set_yscale("log")
 axes[0].set_title("Energy score")
 axes[1].set_title("Physical posterior-mean RMSE")
 axes[2].set_title("Physical posterior spread")
@@ -2928,6 +3292,7 @@ ax.plot(trajectory_mc_study["M"], trajectory_mc_study["mean"], marker="o")
 ax.fill_between(trajectory_mc_study["M"], trajectory_mc_study["lower"],
                 trajectory_mc_study["upper"], alpha=0.16)
 ax.set_xscale("log", base=2)
+ax.set_yscale("log")
 ax.set_xlabel("independent evaluation trajectories M")
 ax.set_ylabel("empirical mean final-step physical-theta energy score")
 ax.set_title("M -> large: Monte Carlo estimate of population risk stabilises", fontweight="bold")
@@ -2974,6 +3339,7 @@ fig, ax = plt.subplots(figsize=(8.2, 5.0), constrained_layout=True)
 ax.plot(prior_cloud_study["num_particles"],
         prior_cloud_study["posterior_mean_sd_across_prior_clouds"], marker="o")
 ax.set_xscale("log", base=2)
+ax.set_yscale("log")
 ax.set_xlabel("prior particles N")
 ax.set_ylabel("RMS SD of physical posterior mean across fresh prior clouds")
 ax.set_title("Finite-prior representation stability for fixed observed data", fontweight="bold")
@@ -3051,9 +3417,12 @@ summary = {
     "sequential_posterior_training": True,
     "time_recurrence": "jax.lax.scan",
     "conditioning": "particle self-attention + cross-attention to one batch-level causal observation-memory prefix used at every step",
+    "min_observations_per_step": CFG.min_observations_per_step,
     "max_observations_per_step": CFG.max_observations_per_step,
     "test_observations_per_step": CFG.test_observations_per_step,
     "trajectory_length": CFG.trajectory_length,
+    "evaluation_trajectory_length": CFG.evaluation_trajectory_length,
+    "heldout_shapes": [list(shape) for shape in HELDOUT_SHAPES],
     "num_particles": CFG.num_particles,
     "best_epoch": int(result["best_epoch"]),
     "best_val_loss": float(result["best_val_loss"]),
@@ -3061,6 +3430,12 @@ summary = {
         key: float(value)
         for key, value in result["final_metrics"].items()
         if np.ndim(value) == 0
+    },
+    "dimensional_generalisation": {
+        "seen_final_rmse": float(np.mean(dimensional_generalisation["rmse_by_t"][~dimensional_generalisation["heldout"], -1])),
+        "heldout_final_rmse": float(np.mean(dimensional_generalisation["rmse_by_t"][dimensional_generalisation["heldout"], -1])),
+        "seen_final_energy": float(np.mean(dimensional_generalisation["energy_by_t"][~dimensional_generalisation["heldout"], -1])),
+        "heldout_final_energy": float(np.mean(dimensional_generalisation["energy_by_t"][dimensional_generalisation["heldout"], -1])),
     },
 }
 save_json(run_dir / "artefacts" / "final_summary.json", summary)
