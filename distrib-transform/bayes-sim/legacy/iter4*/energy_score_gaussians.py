@@ -150,7 +150,7 @@ class GaussianBayesConfig:
     y_scale: float = 3.0
 
     # Optimisation: identical recipe and energy-score-only objective.
-    epochs: int = 40
+    epochs: int = 10
     learning_rate: float = 2e-4
     weight_decay: float = 1e-4
     grad_clip_norm: float = 10.0
