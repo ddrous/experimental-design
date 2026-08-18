@@ -84,6 +84,7 @@ import datetime
 import json
 import math
 import itertools
+import re
 from pathlib import Path
 import time
 from typing import Any
@@ -107,7 +108,7 @@ Array = jax.Array
 # Execution switch.
 # - train_wm=True: create a new run and train the amortized iid transport model.
 # - train_wm=False: reload an existing run from the current folder.
-train_wm: bool = True
+train_wm: bool = False
 
 import seaborn as sns
 sns.set_theme(style="whitegrid", rc={"figure.facecolor": "white", "axes.facecolor": "white"})
@@ -133,14 +134,14 @@ class BayesTransportConfig:
     # trajectory draws a NEW exchangeable diagonal Gaussian-mixture prior.  The number of
     # mixture components, component means/scales, and weights are all random.  Each Gaussian
     # component has a small configurable chance of becoming (near-)degenerate.
-    use_meta_prior: bool = False
+    use_meta_prior: bool = True
     meta_prior_min_components: int = 1
     meta_prior_max_components: int = 8
     meta_prior_component_mean_std: float = 1.5
     meta_prior_component_std_min: float = 0.20
     meta_prior_component_std_max: float = 2.00
     meta_prior_dirichlet_concentration: float = 1.0
-    meta_prior_degenerate_probability: float = 0.01
+    meta_prior_degenerate_probability: float = 0.05
     meta_prior_degenerate_std: float = 0.0
 
     design_low: float = -3.0
@@ -176,7 +177,7 @@ class BayesTransportConfig:
     min_observations_per_step: int = 1
     max_observations_per_step: int = 8
     test_observations_per_step: int = 4
-    num_particles: int = 32
+    num_particles: int = 64
     n_train_trajectories: int = 4096
     n_eval_trajectories: int = 256
     batch_size: int = 16*8
@@ -184,7 +185,7 @@ class BayesTransportConfig:
     # Single sequential-evaluation horizon used everywhere outside the iid training objective.
     # In reload mode this field is intentionally taken from the CURRENT script configuration,
     # so a saved model can be stress-tested on a longer trajectory without retraining.
-    evaluation_trajectory_length: int = 64
+    evaluation_trajectory_length: int = 64*2
     n_evaluation_trajectories_per_shape: int = 16
 
     # Continuous host-side iid simulator stream.  n_train_trajectories is retained for backward
@@ -213,17 +214,17 @@ class BayesTransportConfig:
     # Omin,...,Omax.  The whole cloud is the reported predictive distribution; particle
     # self-attention is therefore compatible with the loss and does not require independence
     # between transported particles.
-    epochs: int = 500
+    epochs: int = 12000
     learning_rate: float = 1e-5
     weight_decay: float = 1e-4
     grad_clip_norm: float = 1000.0
     # Validation-driven ReduceLROnPlateau.  The fixed iid validation set is evaluated once
     # per epoch; after this many non-improving epochs the effective learning rate is halved.
-    lr_plateau_patience: int = 20
+    lr_plateau_patience: int = 100
     lr_plateau_rtol: float = 1e-4
 
     # Persistence / visualisation cadence.
-    save_every_epochs: int = 10
+    save_every_epochs: int = 1000
     final_plot_examples: int = 3
     grid_size: int = 180
 
@@ -317,19 +318,92 @@ def validate_config(cfg: BayesTransportConfig):
 
 # One active configuration only. In reload mode the architecture is reconstructed from the
 # saved AE-style run configuration. Obsolete keys from older decoder/SIGReg runs are ignored.
+def _reload_log_candidates(run_dir: Path) -> list[Path]:
+    """Return a short, deterministic list of plausible nohup logs for an interrupted run."""
+    directories = [run_dir, *list(run_dir.parents)[:3]]
+    candidates: list[Path] = []
+    for directory in directories:
+        for name in ("nohup.log", "nohup.out"):
+            candidate = directory / name
+            if candidate not in candidates:
+                candidates.append(candidate)
+    return candidates
+
+
+def _find_reload_nohup_log(run_dir: Path) -> Path | None:
+    """Prefer a nearby nohup log whose recorded run directory matches this reload folder."""
+    existing = [path for path in _reload_log_candidates(run_dir) if path.is_file()]
+    if not existing:
+        return None
+    for path in existing:
+        try:
+            # The run-directory declaration is near the start, so avoid reading a potentially
+            # very long training log merely to identify it.
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                prefix = handle.read(64_000)
+            if f"Run directory: {run_dir}" in prefix or run_dir.name in prefix:
+                return path
+        except OSError:
+            continue
+    return existing[0]
+
+
+def _config_dict_from_nohup(path: Path) -> dict[str, Any] | None:
+    """Recover the printed YAML configuration when config.yaml is unavailable."""
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            prefix = handle.read(128_000)
+    except OSError:
+        return None
+    marker = "Configuration:\n"
+    start = prefix.find(marker)
+    if start < 0:
+        return None
+    start += len(marker)
+    end = prefix.find("\nRun directory:", start)
+    if end < 0:
+        return None
+    try:
+        recovered = yaml.safe_load(prefix[start:end].lstrip())
+    except yaml.YAMLError:
+        return None
+    return recovered if isinstance(recovered, dict) else None
+
+
 _script_cfg = BayesTransportConfig()
+_reload_nohup_path: Path | None = None
 if train_wm:
     CFG = _script_cfg
 else:
     _reload_run_dir = Path.cwd().expanduser().resolve()
     _config_path = _reload_run_dir / "config.yaml"
-    if not _config_path.is_file():
-        raise FileNotFoundError(
-            "With train_wm=False, run the notebook from the existing sequential run "
-            f"folder itself. Could not find: {_config_path}"
+    _reload_nohup_path = _find_reload_nohup_log(_reload_run_dir)
+
+    _saved_cfg_dict: dict[str, Any] | None = None
+    if _config_path.is_file():
+        try:
+            with _config_path.open("r", encoding="utf-8") as handle:
+                loaded_config = yaml.safe_load(handle)
+            if isinstance(loaded_config, dict):
+                _saved_cfg_dict = loaded_config
+        except (OSError, yaml.YAMLError) as exc:
+            print(f"[reload] warning: could not read {_config_path}: {exc}")
+
+    if _saved_cfg_dict is None and _reload_nohup_path is not None:
+        _saved_cfg_dict = _config_dict_from_nohup(_reload_nohup_path)
+        if _saved_cfg_dict is not None:
+            print(f"[reload] recovered saved configuration from {_reload_nohup_path}")
+
+    if _saved_cfg_dict is None:
+        # Reload should remain usable after an interrupted job even if only a model checkpoint
+        # survived.  The current script configuration is the last-resort skeleton; loading the
+        # Equinox checkpoint will still fail clearly if its architecture is genuinely different.
+        print(
+            "[reload] warning: no readable config.yaml or recoverable nohup configuration; "
+            "using the current script configuration as the model skeleton."
         )
-    with _config_path.open("r", encoding="utf-8") as handle:
-        _saved_cfg_dict = yaml.safe_load(handle)
+        _saved_cfg_dict = asdict(_script_cfg)
+
     _valid_cfg_fields = set(BayesTransportConfig.__dataclass_fields__)
     _saved_cfg_dict = {k: v for k, v in _saved_cfg_dict.items() if k in _valid_cfg_fields}
     for _tuple_field in ("particle_limit_values", "trajectory_mc_values"):
@@ -3140,6 +3214,7 @@ def train_model(
         rtol=cfg.lr_plateau_rtol,
         cooldown=0,
         accumulation_size=1,
+        min_scale=0.01
     )
     plateau_state = plateau.init(params)
 
@@ -3404,6 +3479,298 @@ def train_model(
         "final_metrics": final_metrics,
     }
 
+def _recover_epoch_history_from_nohup(path: Path | None) -> dict[str, np.ndarray] | None:
+    """Recover every reliable epoch-level quantity printed by an interrupted training job.
+
+    The nohup log cannot recreate per-gradient-step arrays, objective decompositions, gradient
+    norms, or the full by-prefix/by-sequential-step validation curves stored in history.npz.
+    It does, however, contain one complete summary for every finished epoch.  We recover all
+    quantities in those summaries so reload mode can still produce substantive training plots.
+    """
+    if path is None or not path.is_file():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        print(f"[reload] warning: could not read training log {path}: {exc}")
+        return None
+
+    pattern = re.compile(
+        r"^\[amortized\] epoch\s+(\d+): train ES=([^|\s]+) \| "
+        r"val ES=([^|\s]+) \| val RMSE=([^|\s]+) \| "
+        r"lr=([^|\s]+) -> ([^|\s]+) \|\| "
+        r"seq final ES=([^|\s]+) \| seq final RMSE=([^|\s]+) \| "
+        r"([^|\s]+)s$",
+        flags=re.MULTILINE,
+    )
+    rows = pattern.findall(text)
+    if not rows:
+        return None
+
+    values = np.asarray(rows, dtype=object)
+    return {
+        "epoch": values[:, 0].astype(np.int32),
+        "epoch_train_loss": values[:, 1].astype(np.float64),
+        "epoch_val_loss": values[:, 2].astype(np.float64),
+        "epoch_val_mean_rmse": values[:, 3].astype(np.float64),
+        "epoch_learning_rate": values[:, 4].astype(np.float64),
+        "epoch_next_learning_rate": values[:, 5].astype(np.float64),
+        "epoch_seq_final_energy_score": values[:, 6].astype(np.float64),
+        "epoch_seq_final_rmse": values[:, 7].astype(np.float64),
+        "epoch_seconds": values[:, 8].astype(np.float64),
+    }
+
+
+def _recover_initial_metrics_from_nohup(path: Path | None) -> dict[str, float] | None:
+    """Recover the pre-training evaluation line when it is present in nohup output."""
+    if path is None or not path.is_file():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    match = re.search(
+        r"^\[amortized\] initial iid ES=([^|\s]+) \| RMSE=([^|\s]+) "
+        r"\|\| sequential final ES=([^|\s]+)$",
+        text,
+        flags=re.MULTILINE,
+    )
+    if match is None:
+        return None
+    return {
+        "initial_iid_energy_score": float(match.group(1)),
+        "initial_iid_rmse": float(match.group(2)),
+        "initial_seq_final_energy_score": float(match.group(3)),
+    }
+
+
+def _rolling_mean_np(values: np.ndarray, window: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return x-offsets and a same-information moving average for dense recovered curves."""
+    values = np.asarray(values, dtype=np.float64)
+    if len(values) < window or window < 2:
+        return np.arange(len(values)), values
+    kernel = np.ones(window, dtype=np.float64) / float(window)
+    return np.arange(window - 1, len(values)), np.convolve(values, kernel, mode="valid")
+
+
+def plot_recovered_nohup_training_diagnostics(
+    recovered: dict[str, np.ndarray],
+    best_epoch: int | None,
+    destination: Path | None = None,
+    *,
+    initial_metrics: dict[str, float] | None = None,
+    cfg: BayesTransportConfig = CFG,
+):
+    """Plot all reliable training diagnostics recoverable from an interrupted nohup log.
+
+    This is deliberately separate from plot_training_diagnostics: the original figure remains
+    unchanged whenever history.npz is available.  Here we plot only quantities that were actually
+    printed once per completed epoch, plus the optional pre-training evaluation line.  No missing
+    per-step, attraction/repulsion, gradient-norm, or by-prefix trajectories are fabricated.
+    """
+    epochs = np.asarray(recovered["epoch"], dtype=np.int32)
+    if not len(epochs):
+        return
+
+    train_es = np.asarray(recovered["epoch_train_loss"], dtype=np.float64)
+    val_es = np.asarray(recovered["epoch_val_loss"], dtype=np.float64)
+    val_rmse = np.asarray(recovered["epoch_val_mean_rmse"], dtype=np.float64)
+    seq_es = np.asarray(recovered["epoch_seq_final_energy_score"], dtype=np.float64)
+    seq_rmse = np.asarray(recovered["epoch_seq_final_rmse"], dtype=np.float64)
+    learning_rate = np.asarray(recovered["epoch_learning_rate"], dtype=np.float64)
+    next_learning_rate = np.asarray(recovered["epoch_next_learning_rate"], dtype=np.float64)
+    epoch_seconds = np.asarray(recovered["epoch_seconds"], dtype=np.float64)
+
+    smoothing_window = min(100, max(10, len(epochs) // 50)) if len(epochs) >= 20 else 1
+    smooth_index, train_smooth = _rolling_mean_np(train_es, smoothing_window)
+    _, val_smooth = _rolling_mean_np(val_es, smoothing_window)
+    _, rmse_smooth = _rolling_mean_np(val_rmse, smoothing_window)
+    _, seq_es_smooth = _rolling_mean_np(seq_es, smoothing_window)
+    _, seq_rmse_smooth = _rolling_mean_np(seq_rmse, smoothing_window)
+    smooth_epochs = epochs[smooth_index]
+
+    fig, axes = plt.subplots(2, 3, figsize=(17.2, 9.2), constrained_layout=True)
+
+    axes[0, 0].plot(epochs, np.maximum(train_es, 1e-12), linewidth=0.65, alpha=0.22, label="train ES")
+    axes[0, 0].plot(epochs, np.maximum(val_es, 1e-12), linewidth=0.65, alpha=0.22, label="iid val ES")
+    axes[0, 0].plot(
+        smooth_epochs,
+        np.maximum(train_smooth, 1e-12),
+        linewidth=1.8,
+        label=f"train ES ({smoothing_window}-epoch mean)",
+    )
+    axes[0, 0].plot(
+        smooth_epochs,
+        np.maximum(val_smooth, 1e-12),
+        linewidth=1.8,
+        label=f"iid val ES ({smoothing_window}-epoch mean)",
+    )
+    if initial_metrics is not None and "initial_iid_energy_score" in initial_metrics:
+        axes[0, 0].scatter(
+            [0], [max(initial_metrics["initial_iid_energy_score"], 1e-12)],
+            marker="x", s=55, label="pre-training iid ES",
+        )
+    axes[0, 0].set_title("Energy score through training", loc="left", fontweight="bold")
+    axes[0, 0].set_ylabel("energy score")
+    axes[0, 0].set_yscale("log")
+
+    axes[0, 1].plot(epochs, np.maximum(val_rmse, 1e-12), linewidth=0.65, alpha=0.24, label="iid val RMSE")
+    axes[0, 1].plot(
+        smooth_epochs,
+        np.maximum(rmse_smooth, 1e-12),
+        linewidth=1.9,
+        label=f"{smoothing_window}-epoch mean",
+    )
+    if initial_metrics is not None and "initial_iid_rmse" in initial_metrics:
+        axes[0, 1].scatter(
+            [0], [max(initial_metrics["initial_iid_rmse"], 1e-12)],
+            marker="x", s=55, label="pre-training iid RMSE",
+        )
+    axes[0, 1].set_title("IID validation posterior-mean RMSE", loc="left", fontweight="bold")
+    axes[0, 1].set_ylabel("RMSE")
+    axes[0, 1].set_yscale("log")
+
+    axes[0, 2].plot(epochs, np.maximum(seq_es, 1e-12), linewidth=0.65, alpha=0.24, label="sequential final ES")
+    axes[0, 2].plot(
+        smooth_epochs,
+        np.maximum(seq_es_smooth, 1e-12),
+        linewidth=1.9,
+        label=f"{smoothing_window}-epoch mean",
+    )
+    if initial_metrics is not None and "initial_seq_final_energy_score" in initial_metrics:
+        axes[0, 2].scatter(
+            [0], [max(initial_metrics["initial_seq_final_energy_score"], 1e-12)],
+            marker="x", s=55, label="pre-training sequential ES",
+        )
+    axes[0, 2].set_title("Evaluation-only repeated-Bayes final ES", loc="left", fontweight="bold")
+    axes[0, 2].set_ylabel("final energy score")
+    axes[0, 2].set_yscale("log")
+
+    axes[1, 0].plot(epochs, np.maximum(seq_rmse, 1e-12), linewidth=0.65, alpha=0.24, label="sequential final RMSE")
+    axes[1, 0].plot(
+        smooth_epochs,
+        np.maximum(seq_rmse_smooth, 1e-12),
+        linewidth=1.9,
+        label=f"{smoothing_window}-epoch mean",
+    )
+    axes[1, 0].set_title("Evaluation-only repeated-Bayes final RMSE", loc="left", fontweight="bold")
+    axes[1, 0].set_ylabel("final RMSE")
+    axes[1, 0].set_yscale("log")
+
+    axes[1, 1].step(epochs, np.maximum(learning_rate, 1e-16), where="post", linewidth=1.5, label="used")
+    if not np.array_equal(learning_rate, next_learning_rate):
+        axes[1, 1].step(
+            epochs,
+            np.maximum(next_learning_rate, 1e-16),
+            where="post",
+            linewidth=1.1,
+            linestyle="--",
+            label="next epoch",
+        )
+    axes[1, 1].set_title("Effective learning-rate schedule", loc="left", fontweight="bold")
+    axes[1, 1].set_ylabel("learning rate")
+    axes[1, 1].set_yscale("log")
+
+    finite_seconds = np.where(np.isfinite(epoch_seconds), epoch_seconds, 0.0)
+    axes[1, 2].plot(epochs, epoch_seconds, linewidth=0.65, alpha=0.35, label="epoch duration")
+    if len(epoch_seconds) >= 20:
+        duration_index, duration_smooth = _rolling_mean_np(epoch_seconds, smoothing_window)
+        axes[1, 2].plot(
+            epochs[duration_index], duration_smooth, linewidth=1.8,
+            label=f"{smoothing_window}-epoch mean",
+        )
+    axes[1, 2].set_title("Epoch duration and cumulative logged time", loc="left", fontweight="bold")
+    axes[1, 2].set_ylabel("seconds / epoch")
+    cumulative_axis = axes[1, 2].twinx()
+    cumulative_axis.plot(epochs, np.cumsum(finite_seconds) / 3600.0, linestyle=":", linewidth=1.5)
+    cumulative_axis.set_ylabel("cumulative logged hours")
+
+    for ax in axes.ravel():
+        ax.set_xlabel("completed epoch")
+        ax.grid(alpha=0.2)
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(fontsize=7)
+        if best_epoch is not None and epochs[0] <= int(best_epoch) <= epochs[-1]:
+            ax.axvline(int(best_epoch), linestyle="--", linewidth=1.0, alpha=0.75)
+
+    finite_val = np.isfinite(val_es)
+    if np.any(finite_val):
+        finite_indices = np.flatnonzero(finite_val)
+        best_index = int(finite_indices[np.argmin(val_es[finite_val])])
+        recovered_best_epoch = int(epochs[best_index])
+        recovered_best_loss = float(val_es[best_index])
+        axes[0, 0].scatter(
+            [recovered_best_epoch], [max(recovered_best_loss, 1e-12)], marker="*", s=90,
+            label=f"log-best epoch {recovered_best_epoch}",
+        )
+        axes[0, 0].legend(fontsize=7)
+
+    fig.suptitle(
+        "Recovered interrupted-run training diagnostics from nohup log\n"
+        f"Single-cloud energy-score training + sequential evaluation ({cfg.posterior_conditioning})",
+        fontsize=14,
+        fontweight="bold",
+    )
+    if destination is not None:
+        fig.savefig(destination, dpi=170)
+    display(fig)
+    plt.close(fig)
+
+
+def _nohup_epoch_record(
+    recovered: dict[str, np.ndarray] | None,
+    epoch: int | None,
+) -> dict[str, float] | None:
+    if recovered is None or epoch is None:
+        return None
+    hits = np.flatnonzero(recovered["epoch"] == int(epoch))
+    if not len(hits):
+        return None
+    index = int(hits[-1])
+    return {
+        name: float(values[index])
+        for name, values in recovered.items()
+        if name != "epoch"
+    }
+
+
+def _full_training_history_available(history: dict[str, np.ndarray] | None) -> bool:
+    """Whether the exact existing training-diagnostics plot can be reproduced."""
+    required = {
+        "step_loss",
+        "step_energy_score",
+        "step_mean_rmse",
+        "step_attraction",
+        "step_repulsion",
+        "step_grad_norm",
+        "epoch_train_loss",
+        "epoch_val_loss",
+        "epoch_val_energy_by_o",
+        "epoch_val_energy_by_t",
+        "epoch_val_rmse_by_t",
+    }
+    return history is not None and required.issubset(history) and len(history["epoch_train_loss"]) > 0
+
+
+def _periodic_checkpoint_epoch(path: Path) -> int | None:
+    match = re.fullmatch(r"model_epoch_(\d+)\.eqx", path.name)
+    return int(match.group(1)) if match is not None else None
+
+
+def _reload_checkpoint_candidates(artefact_dir: Path) -> list[Path]:
+    """Prefer the historical best model, then last model, then newest periodic checkpoint."""
+    candidates = [artefact_dir / "model_best.eqx", artefact_dir / "model_last.eqx"]
+    periodic = sorted(
+        artefact_dir.glob("model_epoch_*.eqx"),
+        key=lambda path: _periodic_checkpoint_epoch(path) or -1,
+        reverse=True,
+    )
+    candidates.extend(periodic)
+    return [path for path in candidates if path.is_file()]
+
+
 #%% 18) Create a new run OR reload one existing amortized run folder
 np.random.seed(CFG.seed)
 print("JAX devices:", jax.devices())
@@ -3541,7 +3908,7 @@ plot_source_trajectory(
     fixed_trajectory, CFG, run_dir / "plots" / "fixed_trajectory_sensor_field.png"
 )
 
-#%% 19) Train the single-cloud amortized model, or reload the local best model
+#%% 19) Train the single-cloud amortized model, or reload the best available local checkpoint
 # Observation embedder + theta embedder + Posterior Transformer are optimized jointly from
 # the SAME physical-theta empirical energy-score objective.  The training graph contains no
 # posterior recurrence.  The historical lax.scan path is called only by sequential evaluation.
@@ -3557,36 +3924,223 @@ if train_wm:
     )
 else:
     artefact_dir = run_dir / "artefacts"
-    model_path = artefact_dir / "model_best.eqx"
     history_path = artefact_dir / "history.npz"
     state_path = artefact_dir / "training_state.json"
-    for required_path in (model_path, history_path, state_path):
-        if not required_path.is_file():
-            raise FileNotFoundError(f"Missing saved training artefact: {required_path}")
 
-    print("Reloading best amortized model from:", model_path)
-    best_model = load_model(model_path, CFG, key=jax.random.key(0))
-    with np.load(history_path, allow_pickle=False) as saved_history:
-        history = {key: np.asarray(saved_history[key]) for key in saved_history.files}
-    with state_path.open("r", encoding="utf-8") as handle:
-        training_state = json.load(handle)
-    best_epoch = int(training_state["best_epoch"])
-    best_val_loss = float(training_state["best_val_loss"])
+    # Interrupted jobs can leave a perfectly usable model checkpoint without the auxiliary
+    # history/state files.  Treat the model as essential and everything else as recoverable or
+    # optional.  If model_best is absent/corrupt, fall back to model_last and then the newest
+    # periodic checkpoint produced by save_every_epochs.
+    checkpoint_candidates = _reload_checkpoint_candidates(artefact_dir)
+    if not checkpoint_candidates:
+        raise FileNotFoundError(
+            "Reload mode needs at least one model checkpoint in artefacts/: expected one of "
+            "model_best.eqx, model_last.eqx, or model_epoch_*.eqx."
+        )
+
+    best_model = None
+    model_path = None
+    checkpoint_errors: list[str] = []
+    for candidate in checkpoint_candidates:
+        try:
+            print("[reload] trying model checkpoint:", candidate)
+            best_model = load_model(candidate, CFG, key=jax.random.key(0))
+            model_path = candidate
+            break
+        except Exception as exc:
+            checkpoint_errors.append(f"{candidate.name}: {type(exc).__name__}: {exc}")
+            print(f"[reload] warning: could not load {candidate.name}; trying the next checkpoint.")
+    if best_model is None or model_path is None:
+        joined_errors = "\n  ".join(checkpoint_errors)
+        raise RuntimeError(f"No compatible saved model checkpoint could be loaded.\n  {joined_errors}")
+    print("[reload] loaded amortized model from:", model_path)
+
+    # Full history is optional.  A stopped process may have a checkpoint but no usable NPZ.
+    history: dict[str, np.ndarray] | None = None
+    if history_path.is_file():
+        try:
+            with np.load(history_path, allow_pickle=False) as saved_history:
+                history = {key: np.asarray(saved_history[key]) for key in saved_history.files}
+            print(f"[reload] loaded full training history from {history_path}")
+        except Exception as exc:
+            print(f"[reload] warning: could not read {history_path}: {exc}")
+    else:
+        print(f"[reload] history file not found; continuing without {history_path.name}.")
+
+    # training_state.json is also optional.  Recover its important scalar information from
+    # nohup.log when possible; this is enough to identify the historical best checkpoint.
+    training_state: dict[str, Any] = {}
+    if state_path.is_file():
+        try:
+            with state_path.open("r", encoding="utf-8") as handle:
+                loaded_state = json.load(handle)
+            if isinstance(loaded_state, dict):
+                training_state = loaded_state
+                print(f"[reload] loaded training state from {state_path}")
+        except Exception as exc:
+            print(f"[reload] warning: could not read {state_path}: {exc}")
+    else:
+        print(f"[reload] training-state file not found; continuing without {state_path.name}.")
+
+    recovered_epoch_history = _recover_epoch_history_from_nohup(_reload_nohup_path)
+    recovered_initial_metrics = _recover_initial_metrics_from_nohup(_reload_nohup_path)
+    if recovered_epoch_history is not None:
+        print(
+            f"[reload] recovered {len(recovered_epoch_history['epoch'])} completed epoch summaries "
+            f"from {_reload_nohup_path}."
+        )
+        # Preserve the recovered compact information separately; it is intentionally not named
+        # history.npz because the nohup log cannot reconstruct per-step/by-prefix training arrays.
+        try:
+            np.savez_compressed(
+                artefact_dir / "reload_epoch_history_from_nohup.npz",
+                **recovered_epoch_history,
+            )
+            csv_names = (
+                "epoch", "epoch_train_loss", "epoch_val_loss", "epoch_val_mean_rmse",
+                "epoch_learning_rate", "epoch_next_learning_rate",
+                "epoch_seq_final_energy_score", "epoch_seq_final_rmse", "epoch_seconds",
+            )
+            csv_values = np.column_stack([recovered_epoch_history[name] for name in csv_names])
+            np.savetxt(
+                artefact_dir / "reload_epoch_history_from_nohup.csv",
+                csv_values,
+                delimiter=",",
+                header=",".join(csv_names),
+                comments="",
+            )
+            if recovered_initial_metrics is not None:
+                save_json(
+                    artefact_dir / "reload_initial_metrics_from_nohup.json",
+                    recovered_initial_metrics,
+                )
+        except OSError as exc:
+            print(f"[reload] warning: could not save recovered nohup history: {exc}")
+
+    history_best_epoch: int | None = None
+    history_best_val_loss: float | None = None
+    history_last_epoch: int | None = None
+    if history is not None and "epoch_val_loss" in history:
+        history_val = np.asarray(history["epoch_val_loss"], dtype=np.float64)
+        finite = np.isfinite(history_val)
+        if np.any(finite):
+            finite_indices = np.flatnonzero(finite)
+            best_index = int(finite_indices[np.argmin(history_val[finite])])
+            history_best_epoch = best_index + 1
+            history_best_val_loss = float(history_val[best_index])
+        if len(history_val):
+            history_last_epoch = len(history_val)
+
+    nohup_best_epoch: int | None = None
+    nohup_best_val_loss: float | None = None
+    nohup_last_epoch: int | None = None
+    if recovered_epoch_history is not None:
+        recovered_epochs = recovered_epoch_history["epoch"]
+        recovered_val = recovered_epoch_history["epoch_val_loss"]
+        finite = np.isfinite(recovered_val)
+        if np.any(finite):
+            finite_indices = np.flatnonzero(finite)
+            best_index = int(finite_indices[np.argmin(recovered_val[finite])])
+            nohup_best_epoch = int(recovered_epochs[best_index])
+            nohup_best_val_loss = float(recovered_val[best_index])
+        nohup_last_epoch = int(recovered_epochs[-1])
+
+    checkpoint_kind = (
+        "best" if model_path.name == "model_best.eqx"
+        else "last" if model_path.name == "model_last.eqx"
+        else "periodic"
+    )
+    periodic_epoch = _periodic_checkpoint_epoch(model_path)
+    if checkpoint_kind == "best":
+        if "best_epoch" in training_state and "best_val_loss" in training_state:
+            loaded_epoch = int(training_state["best_epoch"])
+            best_val_loss = float(training_state["best_val_loss"])
+        else:
+            best_candidates = [
+                (epoch, loss)
+                for epoch, loss in (
+                    (history_best_epoch, history_best_val_loss),
+                    (nohup_best_epoch, nohup_best_val_loss),
+                )
+                if epoch is not None and loss is not None and np.isfinite(loss)
+            ]
+            if best_candidates:
+                loaded_epoch, best_val_loss = min(best_candidates, key=lambda item: item[1])
+            else:
+                loaded_epoch, best_val_loss = None, None
+    elif checkpoint_kind == "last":
+        if "epoch" in training_state:
+            loaded_epoch = int(training_state["epoch"])
+        else:
+            last_candidates = [
+                epoch for epoch in (history_last_epoch, nohup_last_epoch) if epoch is not None
+            ]
+            loaded_epoch = max(last_candidates) if last_candidates else None
+        record = _nohup_epoch_record(recovered_epoch_history, loaded_epoch)
+        best_val_loss = None if record is None else float(record["epoch_val_loss"])
+    else:
+        loaded_epoch = periodic_epoch
+        record = _nohup_epoch_record(recovered_epoch_history, loaded_epoch)
+        best_val_loss = None if record is None else float(record["epoch_val_loss"])
+
+    # Keep the historical result key for downstream compatibility.  When we had to fall back
+    # from model_best to another checkpoint, this is the epoch of the model actually loaded.
+    best_epoch = loaded_epoch
+
+    # These deterministic validation quantities are cheap enough to regenerate and remove any
+    # dependence on training-time NPZ files.  They also provide a sensible scalar fallback when
+    # the historical validation loss could not be recovered from state/log metadata.
     final_amortized_metrics = evaluate_amortized_model(
         best_model, amortized_eval_data, CFG, seed=CFG.seed + 91_000
     )
     final_metrics = evaluate_model(best_model, eval_data, CFG, seed=CFG.seed + 92_000)
+    if best_val_loss is None or not np.isfinite(best_val_loss):
+        best_val_loss = float(final_amortized_metrics["loss"])
+        print(
+            "[reload] historical validation loss unavailable; using the regenerated iid "
+            f"validation loss {best_val_loss:.6f} for summary metadata."
+        )
 
-    plot_training_diagnostics(
-        history, best_epoch, run_dir / "plots" / "training_diagnostics.png", CFG
-    )
+    has_full_training_history = _full_training_history_available(history)
+    if has_full_training_history:
+        plot_training_diagnostics(
+            history,
+            0 if best_epoch is None else int(best_epoch),
+            run_dir / "plots" / "training_diagnostics.png",
+            CFG,
+        )
+
+    if recovered_epoch_history is not None:
+        # The nohup figure uses every reliable epoch-level quantity available in the interrupted
+        # log.  If the exact history is absent it becomes the main training_diagnostics.png;
+        # otherwise it is retained as a complementary recovered-log diagnostic.
+        recovered_destination = (
+            run_dir / "plots" / "training_diagnostics_from_nohup.png"
+            if has_full_training_history
+            else run_dir / "plots" / "training_diagnostics.png"
+        )
+        plot_recovered_nohup_training_diagnostics(
+            recovered_epoch_history,
+            best_epoch,
+            recovered_destination,
+            initial_metrics=recovered_initial_metrics,
+            cfg=CFG,
+        )
+        print(f"[reload] wrote recovered training diagnostics to {recovered_destination}")
+    elif not has_full_training_history:
+        print(
+            "[reload] no full history.npz and no recoverable epoch summaries in nohup output; "
+            "training-history plots are unavailable, but all model-based diagnostics continue."
+        )
+
+    epoch_label = "epoch unknown" if best_epoch is None else f"epoch {best_epoch}"
     plot_posterior_evolution(
         best_model,
         fixed_trajectory,
         fixed_prior_particles,
         CFG,
         run_dir / "plots" / "fixed_trajectory_best_model.png",
-        f"evaluation-only repeated Bayes ({CFG.posterior_conditioning}, epoch {best_epoch})",
+        f"evaluation-only repeated Bayes ({CFG.posterior_conditioning}, {epoch_label})",
     )
     result = {
         "model": best_model,
@@ -3595,6 +4149,9 @@ else:
         "best_val_loss": best_val_loss,
         "amortized_final_metrics": final_amortized_metrics,
         "final_metrics": final_metrics,
+        "reload_checkpoint": str(model_path),
+        "reload_checkpoint_kind": checkpoint_kind,
+        "reload_nohup_log": None if _reload_nohup_path is None else str(_reload_nohup_path),
     }
 
 model = result["model"]
@@ -4590,8 +5147,11 @@ summary = {
     "evaluation_trajectory_length": CFG.evaluation_trajectory_length,
     "heldout_shapes": [list(shape) for shape in HELDOUT_SHAPES],
     "num_particles": CFG.num_particles,
-    "best_epoch": int(result["best_epoch"]),
+    "best_epoch": (None if result["best_epoch"] is None else int(result["best_epoch"])),
     "best_val_energy_score": float(result["best_val_loss"]),
+    "reload_checkpoint": result.get("reload_checkpoint"),
+    "reload_checkpoint_kind": result.get("reload_checkpoint_kind"),
+    "reload_nohup_log": result.get("reload_nohup_log"),
     "final_amortized_metrics": {
         key: float(value)
         for key, value in result["amortized_final_metrics"].items()
