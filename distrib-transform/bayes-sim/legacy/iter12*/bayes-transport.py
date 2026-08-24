@@ -1,54 +1,139 @@
 #%% 1) Imports, configuration, and experiment conventions
-"""Single-cloud Bayes transport with energy-score, DEQ, and drifting training modes.
+"""Single-cloud particle transport trained with an empirical energy score.
 
-The simulator, posterior Transformer, observation-prefix handling, physical particle
-representation, heterogeneous (S,D) support, and evaluation protocol retain the original
-structure. Training is selected by ``training_mode``:
+This notebook-style file preserves the original source-localisation simulator, optional dimension-agnostic
+theta/observation embedders, physical particle representation, heterogeneous (S,D) support, and
+sequential evaluation diagnostics.  When S and D are fixed throughout training, the dimension-agnostic
+embedders are bypassed completely: particles enter the Posterior Transformer from physical S*D width and
+observations enter from physical D+1 width, with zero learnable parameters in either fixed-shape input
+embedder.  When Omin=Omax=1, the likelihood Transformer is additionally retained only as a parameter-free
+identity pass-through, so the single observation goes directly to the Posterior Transformer.  For genuine
+multi-observation prefixes, the likelihood Transformer owns its learned input projection and causal blocks.
+Training uses iid simulator rows together with a synthetic
+interpolated input cloud designed to expose the Posterior Transformer to concentrated and potentially
+misspecified priors without amortizing over a family of distinct prior laws.
 
-* ``"energy_score"``: one prior->posterior transport optimized by the exact empirical
-  multivariate energy score.
-* ``"deq_fixed_point"``: one theta* supplies a finite sequence of fresh observation blocks.
-  The resulting recurrent Bayes trajectory is represented as an augmented triangular equilibrium
-  and differentiated with a custom implicit VJP. The memory-safe ``triangular`` solver exploits
-  this causal structure directly; Picard and Anderson remain available for forward/backward
-  ablations. No forward root-finder iteration is differentiated through.
-* ``"drifting"``: one ordinary transport call, followed by frozen-target regression toward
-  ``x + eta V(x)``. There is NO inner time/fixed-point rollout in this mode: as in Deng et al.,
-  evolution occurs across optimizer steps because the network parameters change. The default
-  field combines the paper's anti-symmetric kernel attraction/repulsion field with an optional
-  energy-score-gradient contribution.
+Training algorithm
+------------------
+For each fresh iid training row, all randomness below is generated on the CPU by the PyTorch
+IterableDataset / NumPy simulator; JAX is used only for the neural forward pass and gradient update.
 
-The ``energy_score`` and ``drifting`` modes can additionally train on the model's own historical
-predictions. A bounded host-side replay buffer stores recent final-prefix output clouds together
-with the theta* and observation block that produced that output (plus minimal shape metadata needed
-for heterogeneous padded batches). With configurable probability a future training row starts from
-one of these detached historical clouds instead of a fresh interpolated cloud and reuses the EXACT
-same observation block. Thus the model is deliberately challenged with the same evidence but a
-changed prior cloud, exposing it to its own
-past output distribution without creating a cross-step autodiff graph. Otherwise the original
-shared-tau interpolated prior remains the default input.
+1. Sample the active problem shape S,D.  Let rho_0 be ONE configured base prior: either the uniform
+   distribution on the physical design box [design_low, design_high]^D or the isotropic Gaussian
+   N(0, prior_std^2 I).  Draw N iid full-theta particles z_1,...,z_N ~ rho_0 and one synthetic
+   interpolation anchor theta_tilde ~ rho_0.
+2. Draw interpolation coefficients according to `interpolation_tau_mode` and form
 
-Evaluation is deliberately independent of ``training_mode``. Non-sequential evaluation always
-uses the original direct ``predict_prefixes`` map and exact empirical energy score; sequential
-evaluation always repeatedly applies the same learned Bayes map with ``jax.lax.scan``.
+       c_n = (1-tau_n) z_n + tau_n theta_tilde,     n=1,...,N.
 
-Synthetic fresh training priors are intentionally simple. Draw theta* from the configured base
-prior (Uniform on the physical design box or isotropic Gaussian). With probability
-``synthetic_prior_match_probability`` use theta* as the interpolation anchor, otherwise draw an
-independent anchor from the same base prior. Draw one shared tau ~ Uniform[0,1] for the entire
-cloud and set C_tau,n=(1-tau)Z_n+tau*anchor. No particle-wise tau laws or alternative truth
-sampling modes are retained.
+   The historical shared-tau construction is retained (`shared_uniform`, `shared_logit_normal`,
+   `shared_beta`).  Two particle-wise constructions are additionally available:
+   `iid_uniform`, with tau_n iid Uniform[0,1], and `hierarchical_beta`, which first draws one
+   row-level mean m and then tau_n | m iid Beta(kappa*m, kappa*(1-m)).  The latter preserves
+   cloud-to-cloud concentration variation while also exposing the model to heterogeneous particles.
+3. Draw the actual observation-generating theta* according to `synthetic_truth_sampling_mode`:
+   * "closed_form" (DEFAULT): draw a fresh base sample z* ~ rho_0 and the appropriate independent
+     tau* from the SAME row-level interpolation law, then set
+         theta* = (1-tau*) z* + tau* theta_tilde.
+     For shared-tau modes tau*=tau. For particle-wise modes tau* is an independent draw conditional
+     on the same row-level tau distribution. Thus theta* and the cloud particles are iid conditional
+     on the row-level interpolation variables.
+   * "empirical": retain the script's historical empirical surrogate branch.
+   * "bernoulli_choice": preserve the previous two-path experiment: with probability
+     `synthetic_prior_match_probability` set theta*=theta_tilde, otherwise redraw theta* independently
+     from rho_0.  This mode is kept for ablations but is not the default.
+   Only the resulting theta* belongs to the simulator datum; theta_tilde and interpolation variables
+   remain synthetic dataloader variables used to define the input prior.
+4. Draw Omax designs and noisy observations Y from the physical likelihood conditional on theta*.
+   Rows are independent and no theta* is reused across training rows.  The complete
+   (C_tau,theta*,Y) triples are freshly generated by the dataloader.
+5. If Omin=Omax=1, pass the single normalized/aggregated observation directly to the Posterior
+   Transformer and keep the likelihood Transformer as a zero-parameter identity module.  Otherwise encode
+   all Omax observations once with the causal likelihood Transformer.  For every prefix o=Omin,...,Omax,
+   apply the SAME Posterior Transformer directly to the SAME synthetic input cloud.  There is no posterior
+   recurrence in the training graph.
+6. Score every transported empirical cloud against the single actual theta* with the exact empirical
+   multivariate energy score, average over all batch rows and all prefixes, backpropagate that scalar,
+   and perform one AdamW update (with the existing gradient clipping / plateau schedule).
 
-When both source count and source dimensionality are fixed, ``fixed_shape_learned_projection``
-controls the input interface. If False, the historical parameter-free normalized physical inputs
-are used. If True, each fixed-shape theta particle and each fixed-shape design/outcome token gets
-one learnable linear projection into ``embedding_dim``. This gives fixed-shape runs the same
-embedding-space interface used by heterogeneous-shape runs without instantiating the full TAMO
-aggregation Transformers.
+For one output cloud Q_hat_phi(C,Y)=N^{-1} sum_n delta_{T_phi(C,Y)_n}, the optimized score is
+
+    ES(Q_hat_phi(C,Y), theta*)
+      = N^{-1} sum_n ||theta_n-theta*||
+        - (2 N^2)^{-1} sum_{n,m} ||theta_n-theta_m||.
+
+The whole interacting cloud is the reported empirical distribution, so particle self-attention is
+compatible with this score.  In the default closed-form mode, conditional on the row-level interpolation variables,
+theta* and the input particles are independent draws from the SAME interpolated population law.
+For particle-wise tau modes that law is generally a non-Gaussian location/scale mixture even when
+rho_0 is Gaussian; exact ancestral sampling is nevertheless available.  The legacy Bernoulli mode
+retains the previous matched/misspecified construction.
+
+Observation prefixes
+--------------------
+Each item contains Omax observations.  For genuine multi-observation prefixes, a causal
+LikelihoodSequenceEmbedder processes all Omax observation tokens once and returns contextual tokens.  If
+Omin=Omax=1, that module is a zero-parameter identity pass-through and the single observation signal goes
+straight to the Posterior Transformer.  In fixed-shape mode the input signal is the parameter-free normalized
+physical (design,outcome) vector; otherwise it comes from the TAMO-style observation embedder.
+Training NEVER samples one random
+observation count for a minibatch.  Instead, every prefix o=Omin,...,Omax is used on every gradient
+step.  The Posterior Transformer is vmapped over these prefix counts, and every prefix transport starts
+from the SAME synthetic input cloud.  Therefore training is amortized/non-sequential even though the
+observation encoder is causal.
+
+The Posterior Transformer conditioning mechanism is configurable:
+  * posterior_conditioning='cross_attention': particle residuals cross-attend to memory[:o].
+  * posterior_conditioning='adaln': the o-th causal observation token directly modulates the particle
+    residual stream through AdaLN-Zero-style shift/scale/gates; no observation cross-attention is used.
+
+Sequential evaluation
+---------------------
+Sequential Bayes behaviour is retained as an EVALUATION-ONLY stress test.  A trajectory begins from
+an ordinary tau=0 cloud sampled from the configured base prior.  For one fixed theta*, the same learned
+transport is repeatedly applied to the current particle cloud using a fresh observation block at each
+step.  The resulting cloud is compared against theta* and, where requested, a likelihood-based SNIS
+posterior built from all evidence seen so far.  These sequential rollouts are visualised throughout
+training even though recurrence is absent from the loss.
+
+Input dimensionality
+--------------------
+If either S or D varies across training, the dimensionality-agnostic input interface follows the existing
+TAMO-style aggregation: physical theta particles and (design,outcome) observations are mapped to the
+configured shared embedding width E before posterior conditioning.  If BOTH S and D are fixed, those
+learned aggregation modules are retained in the codebase but are not instantiated: the theta input width is
+exactly S*D and the observation input width is exactly D+1.  The fixed-shape input preprocessors contain
+zero learnable parameters.  With Omin=Omax=1, the likelihood Transformer is also parameter-free and leaves
+that observation signal at its incoming width; otherwise it projects into its configured hidden width L and
+applies causal self-attention.  In both regimes the output
+head returns compact physical theta; only the
+first S*D entries of the static Kmax=Smax*Dmax output are active.  theta_true is never embedded for the loss,
+and no stop-gradient, EMA target, auxiliary latent loss, or decoder is introduced.
+
+Notation used in training arrays
+--------------------------------
+B : number of iid joint samples in a minibatch
+N : number of input/output particles per joint sample
+P = Omax-Omin+1 : number of observation prefixes optimized on every step
+S,D : active source count and coordinate dimension
+E : shared dimension-aggregation width ONLY when S or D varies
+L : likelihood Transformer hidden/context width when active; single-observation bypass uses the incoming width
+Kmax = Smax*Dmax : static compact-theta width
+
+theta_true             [B,Smax,Dmax]
+observations            [B,Omax,Dmax+1]
+prior_particles         [B,N,Smax,Dmax]  # one synthetic interpolated cloud
+particle_inputs         [B,N,S*D] in fixed-shape mode, otherwise [B,N,E]
+likelihood_inputs       [B,Omax,D+1] in fixed-shape mode, otherwise [B,Omax,E]
+observation_contexts    [B,Omax,L] normally; [B,1,observation_input_dim] in the single-observation bypass
+posterior_by_prefix     [B,P,N,Kmax]
+prefix_counts           [P] = Omin,...,Omax
+
+Sequential evaluation arrays keep the original trajectory form [B,T,Omax,...] and are processed by
+the evaluation-only recurrence.  The known likelihood is used only in optional reference diagnostics.
 """
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import asdict, dataclass
 import datetime
 import json
@@ -103,7 +188,7 @@ class BayesTransportConfig:
 
     # Source-localisation simulator. `num_sources` and `source_dim` define only the
     # fixed 2-D diagnostic problem; heterogeneous training still uses the ranges below.
-    num_sources: int = 2
+    num_sources: int = 1
     source_dim: int = 2
 
     # ONE base prior is used throughout the experiment; there is no distribution over distinct prior laws.
@@ -112,9 +197,36 @@ class BayesTransportConfig:
     base_prior_distribution: str = "uniform"  # {"uniform", "gaussian"}
     prior_std: float = 1.0
 
-    # Synthetic-prior law used for every training mode. One tau ~ Uniform[0,1] is shared by
-    # the whole cloud. The interpolation anchor equals the observation-generating theta* with
-    # this probability and is otherwise an independent draw from the same base prior.
+    # Synthetic-prior interpolation coefficients.  All modes use the SAME base prior and a single
+    # row-level interpolation anchor theta_tilde; only the tau construction changes.
+    #
+    # Historical shared-tau modes (retained):
+    #   "shared_uniform"      : one tau ~ Uniform[0,1] for the whole cloud (original default).
+    #   "shared_logit_normal" : one sigmoid(N(loc,scale^2)) tau for the whole cloud.
+    #   "shared_beta"         : one Beta(alpha,beta) tau for the whole cloud.
+    #
+    # Particle-wise modes:
+    #   "iid_uniform"         : tau_n iid Uniform[0,1].
+    #   "hierarchical_beta"   : draw m ~ Uniform(mean_low,mean_high), then
+    #                           tau_n | m iid Beta(kappa*m,kappa*(1-m)).
+    #
+    # hierarchical_beta is the default because it combines particle-level heterogeneity with
+    # row-to-row variation in overall concentration.  kappa -> infinity approaches a shared tau=m.
+    interpolation_tau_mode: str = "shared_uniform"
+    interpolation_tau_concentration: float = 12.0
+    interpolation_tau_mean_low: float = 0.02
+    interpolation_tau_mean_high: float = 0.98
+    interpolation_logit_normal_loc: float = -1.5
+    interpolation_logit_normal_scale: float = 1.0
+    interpolation_shared_beta_alpha: float = 1.0
+    interpolation_shared_beta_beta: float = 5.0
+
+    # How the observation-generating theta* is drawn once the synthetic cloud has been constructed:
+    #   "closed_form"      : DEFAULT; fresh draw from the exact interpolated prior law represented by C_tau.
+    #   "empirical"        : historical cloud-mean + Gaussian-jitter surrogate retained for ablation.
+    #   "bernoulli_choice" : old experiment; theta*=theta_tilde with probability p, otherwise rho_0.
+    synthetic_truth_sampling_mode: str = "bernoulli_choice"  # {"closed_form", "empirical", "bernoulli_choice"}
+    # Used ONLY when synthetic_truth_sampling_mode="bernoulli_choice".
     synthetic_prior_match_probability: float = 1.0
 
     design_low: float = -3.0
@@ -128,20 +240,20 @@ class BayesTransportConfig:
     # while masks ensure that inactive source/coordinate slots never enter an embedder.
     # The listed held-out combinations are NEVER sampled by the training stream; they are
     # reserved for the balanced dimensional-generalisation evaluation after training.
-    min_num_sources: int = 2
-    max_num_sources: int = 2
-    min_source_dim: int = 2
-    max_source_dim: int = 2
+    min_num_sources: int = 1
+    max_num_sources: int = 4
+    min_source_dim: int = 1
+    max_source_dim: int = 4
     # heldout_shapes: tuple[tuple[int, int], ...] = ((1, 6), (6, 1), (3, 3), (6, 6))
-    # heldout_shapes: tuple[tuple[int, int], ...] = ((1, 4), (4, 1), (2, 2), (4, 4))
-    heldout_shapes: tuple[tuple[int, int], ...] = ()
+    heldout_shapes: tuple[tuple[int, int], ...] = ((1, 4), (4, 1), (2, 2), (4, 4))
+    # heldout_shapes: tuple[tuple[int, int], ...] = ()
 
-    # TAMO-style dimension aggregation is used when S and/or D varies during training. In a
-    # fixed-shape run, the expensive aggregation Transformers are still bypassed, but a single
-    # learnable linear projection can optionally map both theta and (design,outcome) inputs into
-    # the same E-dimensional interface used by heterogeneous runs.
+    # TAMO-style dimension aggregation used ONLY when S and/or D varies during training.
+    # In a fixed-shape run these embedders are not instantiated: particle inputs have width
+    # S*D and observation inputs have width D+1, so `embedding_dim` is ignored by these
+    # input preprocessors.  When shapes vary, every observation pair and theta particle is
+    # mapped to one E-vector before entering its downstream Transformer.
     embedding_dim: int = 192
-    fixed_shape_learned_projection: bool = True
     dimension_embedder_depth: int = 4
     scalar_encoder_depth: int = 4
     embedding_heads: int = 8
@@ -158,16 +270,11 @@ class BayesTransportConfig:
     n_eval_trajectories: int = 256
     batch_size: int = 16*2
 
-    # Single sequential-evaluation horizon used by evaluation diagnostics. In reload mode this
-    # field is intentionally taken from the CURRENT script configuration, so a saved model can be
-    # stress-tested on a longer trajectory without retraining.
+    # Single sequential-evaluation horizon used everywhere outside the iid training objective.
+    # In reload mode this field is intentionally taken from the CURRENT script configuration,
+    # so a saved model can be stress-tested on a longer trajectory without retraining.
     evaluation_trajectory_length: int = 8*2
     n_evaluation_trajectories_per_shape: int = 16
-
-    # Maximum recurrent horizon used ONLY by DEQ training. One theta* is held fixed for the
-    # whole row and each temporal coordinate receives a fresh observation block Y_t ~ p(Y|theta*).
-    # Drifting is intentionally one-step and does not use this setting.
-    training_fixed_point_max_iterations: int = 8*2
 
     # Continuous host-side iid simulator stream.  n_train_trajectories is retained for backward
     # configuration compatibility but now means the number of FRESH iid joint samples consumed
@@ -186,9 +293,9 @@ class BayesTransportConfig:
     likelihood_mlp_ratio: int = 4
     likelihood_depth: int = 4
 
-    # Posterior Transformer. `posterior_conditioning` selects observation cross-attention or
-    # direct AdaLN conditioning. Energy-score and drifting training use one prior->posterior call
-    # per prefix; DEQ training and sequential evaluation recurrently reuse the same map.
+    # Posterior Transformer.  Training vmaps this direct prior->posterior map over every prefix.
+    # `posterior_conditioning` selects observation cross-attention or direct AdaLN conditioning.
+    # Sequential recurrence is evaluation-only and repeatedly reuses this same learned map.
     posterior_conditioning: str = "adaln"  # {"cross_attention", "adaln"}
     hidden_dim: int = 256
     heads: int = 8
@@ -201,56 +308,12 @@ class BayesTransportConfig:
     y_center: float = 0.0
     y_scale: float = 3.0
 
-    # Training objective. Evaluation does NOT branch on this option.
-    #   "energy_score"     : direct one-step empirical energy score.
-    #   "deq_fixed_point" : augmented equilibrium + implicit-function custom VJP.
-    #   "drifting"        : one-step frozen drifting-field target regression.
-    training_mode: str = "energy_score"
-
-    # Historical-output replay used ONLY by energy_score and drifting. The buffer contains the
-    # most recent final-prefix model output clouds together with the theta* and EXACT observation
-    # block used to produce each output (plus minimal S,D metadata for padded heterogeneous runs).
-    # With this probability, a row replaces C_tau by a detached historical output and reuses that
-    # stored theta*/observation pair unchanged. A value of 0 disables replay.
-    historical_output_prior_probability: float = 0.5
-    historical_output_buffer_capacity: int = 2048
-
-    # DEQ fixed-point solver. The DEQ state is the WHOLE T-step recurrent cloud trajectory.
-    # "triangular" is an exact causal solver for this particular augmented equilibrium and is
-    # strongly preferred when memory matters. Picard/Anderson are retained as configurable
-    # generic fixed-point solvers. The backward pass can likewise use the exact triangular
-    # implicit recursion, reuse the forward solver ("same"), or choose Picard/Anderson.
-    fixed_point_solver: str = "triangular"  # {"triangular", "picard", "anderson"}
-    fixed_point_backward_solver: str = "triangular"  # {"same", "triangular", "picard", "anderson"}
-    fixed_point_max_steps: int = 40
-    fixed_point_backward_max_steps: int = 40
-    fixed_point_tolerance: float = 1e-4
-    fixed_point_backward_tolerance: float = 1e-5
-    fixed_point_relaxation: float = 0.75
-    fixed_point_anderson_history: int = 5
-    fixed_point_anderson_ridge: float = 1e-4
-    # Optional diagonal stabilisation of (I-J_T^T)u=g for generic backward solvers. Zero gives
-    # the exact IFT equation. The triangular augmented DEQ has I-J_F invertible by construction.
-    fixed_point_backward_regularization: float = 0.0
-
-    # Drifting objective/field choice.
-    #   "energy_score"          : optimize the empirical proper energy score directly. This is a
-    #                             scalar objective rather than a vector field, retained as the
-    #                             proper-score drifting ablation requested here.
-    #   "energy_score_gradient" : frozen target x + eta*(-N grad_x ES), using the analytic gradient.
-    #   "kernel"                : Deng et al. Algorithm-2 attraction/repulsion field.
-    #   "kernel_energy_score_gradient": Deng field plus a weighted energy-score-gradient field.
-    # Historical aliases "energy" and "kernel_energy" are accepted by the helper below.
-    drifting_field: str = "energy_score_gradient"
-    drifting_temperatures: tuple[float, ...] = (0.05, 0.2, 0.8)
-    drifting_eta: float = 1.0
-    drifting_energy_weight: float = 0.25
-    drifting_distance_epsilon: float = 1e-6
-
-    # Optimisation. The scalar differentiated loss is selected above. The direct empirical
-    # energy score is still reported for every mode and remains the validation/model-selection
-    # metric, preserving the original evaluation protocol.
-    epochs: int = 10000
+    # Optimisation.  The training loss is the exact empirical multivariate energy score of
+    # ONE transported N-particle cloud, averaged over B iid joint samples and ALL prefixes
+    # Omin,...,Omax.  The whole cloud is the reported predictive distribution; particle
+    # self-attention is therefore compatible with the loss and does not require independence
+    # between transported particles.
+    epochs: int = 20000
     learning_rate: float = 1e-5
     weight_decay: float = 1e-4
     grad_clip_norm: float = 1000.0
@@ -288,11 +351,8 @@ def validate_config(cfg: BayesTransportConfig):
         cfg.min_num_sources == cfg.max_num_sources
         and cfg.min_source_dim == cfg.max_source_dim
     )
-    if cfg.embedding_dim < 1:
-        raise ValueError("embedding_dim must be >= 1.")
-    # The full dimension-aggregation architecture is used only for heterogeneous-shape runs.
-    # Fixed-shape learned projections may use E without imposing the heterogeneous aggregator's
-    # max-theta-size constraint.
+    # The shared embedding width is an architectural constraint only for heterogeneous-shape
+    # training.  Fixed-shape runs bypass both dimension embedders and therefore do not depend on E.
     if not fixed_shape and max_theta_size > cfg.embedding_dim:
         raise ValueError(
             f"max theta size S*D={max_theta_size} exceeds embedding_dim E={cfg.embedding_dim}. "
@@ -335,8 +395,6 @@ def validate_config(cfg: BayesTransportConfig):
         )
     if cfg.evaluation_trajectory_length < 1:
         raise ValueError("evaluation_trajectory_length must be >= 1.")
-    if cfg.training_fixed_point_max_iterations < 1:
-        raise ValueError("training_fixed_point_max_iterations must be >= 1.")
     if cfg.n_evaluation_trajectories_per_shape < 1:
         raise ValueError("n_evaluation_trajectories_per_shape must be >= 1.")
     all_shapes = {
@@ -353,80 +411,34 @@ def validate_config(cfg: BayesTransportConfig):
         raise ValueError("base_prior_distribution must be 'uniform' or 'gaussian'.")
     if cfg.prior_std <= 0.0:
         raise ValueError("prior_std must be > 0 for Gaussian-base-prior support and normalization.")
+    tau_modes = {
+        "shared_uniform",
+        "shared_logit_normal",
+        "shared_beta",
+        "iid_uniform",
+        "hierarchical_beta",
+    }
+    if cfg.interpolation_tau_mode not in tau_modes:
+        raise ValueError(
+            f"interpolation_tau_mode must be one of {sorted(tau_modes)}; "
+            f"got {cfg.interpolation_tau_mode!r}."
+        )
+    if cfg.interpolation_tau_concentration <= 0.0:
+        raise ValueError("interpolation_tau_concentration must be > 0.")
+    if not (0.0 < cfg.interpolation_tau_mean_low < cfg.interpolation_tau_mean_high < 1.0):
+        raise ValueError(
+            "interpolation_tau_mean_low/high must satisfy 0 < low < high < 1."
+        )
+    if cfg.interpolation_logit_normal_scale <= 0.0:
+        raise ValueError("interpolation_logit_normal_scale must be > 0.")
+    if cfg.interpolation_shared_beta_alpha <= 0.0 or cfg.interpolation_shared_beta_beta <= 0.0:
+        raise ValueError("interpolation_shared_beta_alpha/beta must both be > 0.")
+    if cfg.synthetic_truth_sampling_mode not in {"closed_form", "empirical", "bernoulli_choice"}:
+        raise ValueError(
+            "synthetic_truth_sampling_mode must be 'closed_form', 'empirical', or 'bernoulli_choice'."
+        )
     if not (0.0 <= cfg.synthetic_prior_match_probability <= 1.0):
         raise ValueError("synthetic_prior_match_probability must lie in [0, 1].")
-    if cfg.training_mode not in {"energy_score", "deq_fixed_point", "drifting"}:
-        raise ValueError(
-            "training_mode must be 'energy_score', 'deq_fixed_point', or 'drifting'."
-        )
-    if not (0.0 <= cfg.historical_output_prior_probability <= 1.0):
-        raise ValueError("historical_output_prior_probability must lie in [0, 1].")
-    if cfg.historical_output_buffer_capacity < 1:
-        raise ValueError("historical_output_buffer_capacity must be >= 1.")
-    if cfg.fixed_point_solver not in {"triangular", "picard", "anderson"}:
-        raise ValueError("fixed_point_solver must be 'triangular', 'picard', or 'anderson'.")
-    if cfg.fixed_point_backward_solver not in {"same", "triangular", "picard", "anderson"}:
-        raise ValueError(
-            "fixed_point_backward_solver must be 'same', 'triangular', 'picard', or 'anderson'."
-        )
-    if cfg.fixed_point_max_steps < 1 or cfg.fixed_point_backward_max_steps < 1:
-        raise ValueError("fixed-point max-step counts must both be >= 1.")
-    if (
-        cfg.training_mode == "deq_fixed_point"
-        and cfg.fixed_point_solver == "picard"
-        and cfg.fixed_point_max_steps < cfg.training_fixed_point_max_iterations
-    ):
-        raise ValueError(
-            "For deq_fixed_point with the Picard solver, fixed_point_max_steps must be at "
-            "least training_fixed_point_max_iterations so information can propagate through "
-            "the full augmented recurrent trajectory."
-        )
-    resolved_backward_solver = (
-        cfg.fixed_point_solver
-        if cfg.fixed_point_backward_solver == "same"
-        else cfg.fixed_point_backward_solver
-    )
-    if (
-        cfg.training_mode == "deq_fixed_point"
-        and resolved_backward_solver == "picard"
-        and cfg.fixed_point_backward_max_steps < cfg.training_fixed_point_max_iterations
-    ):
-        raise ValueError(
-            "For deq_fixed_point with a Picard backward solve, "
-            "fixed_point_backward_max_steps must be at least "
-            "training_fixed_point_max_iterations."
-        )
-    if cfg.fixed_point_tolerance <= 0.0 or cfg.fixed_point_backward_tolerance <= 0.0:
-        raise ValueError("fixed-point tolerances must both be > 0.")
-    if not (0.0 < cfg.fixed_point_relaxation <= 1.0):
-        raise ValueError("fixed_point_relaxation must lie in (0, 1].")
-    if cfg.fixed_point_anderson_history < 1:
-        raise ValueError("fixed_point_anderson_history must be >= 1.")
-    if cfg.fixed_point_anderson_ridge <= 0.0:
-        raise ValueError("fixed_point_anderson_ridge must be > 0.")
-    if cfg.fixed_point_backward_regularization < 0.0:
-        raise ValueError("fixed_point_backward_regularization must be >= 0.")
-    if cfg.drifting_field not in {
-        "energy_score",
-        "energy_score_gradient",
-        "kernel",
-        "kernel_energy_score_gradient",
-        # Backward-compatible aliases from the previous revision.
-        "energy",
-        "kernel_energy",
-    }:
-        raise ValueError(
-            "drifting_field must be 'energy_score', 'energy_score_gradient', 'kernel', "
-            "or 'kernel_energy_score_gradient'."
-        )
-    if len(cfg.drifting_temperatures) < 1 or any(t <= 0.0 for t in cfg.drifting_temperatures):
-        raise ValueError("drifting_temperatures must contain only positive values.")
-    if cfg.drifting_eta <= 0.0:
-        raise ValueError("drifting_eta must be > 0.")
-    if cfg.drifting_energy_weight < 0.0:
-        raise ValueError("drifting_energy_weight must be >= 0.")
-    if cfg.drifting_distance_epsilon <= 0.0:
-        raise ValueError("drifting_distance_epsilon must be > 0.")
     if cfg.design_high <= cfg.design_low:
         raise ValueError("design_high must be greater than design_low.")
     if cfg.train_dataloader_num_workers < 0:
@@ -563,7 +575,7 @@ def sample_base_prior_np(
     Uniform mode draws every active source coordinate independently inside the physical
     design box.  Gaussian mode preserves the historical isotropic N(0, prior_std^2 I)
     prior.  This is the t=0 distribution used for sequential evaluation and for the
-    shared-tau synthetic-prior construction used only during training.
+    flow-matching-style synthetic-prior construction used only during training.
     """
     S = cfg.num_sources if num_sources is None else int(num_sources)
     D = cfg.source_dim if source_dim is None else int(source_dim)
@@ -577,6 +589,123 @@ def sample_base_prior_np(
     raise ValueError("base_prior_distribution must be 'uniform' or 'gaussian'.")
 
 
+def _sample_interpolation_taus_np(
+    rng: np.random.Generator,
+    n_particles: int,
+    cfg: BayesTransportConfig = CFG,
+    *,
+    draw_truth_tau: bool,
+) -> tuple[np.ndarray, float | None, dict[str, float | str | bool]]:
+    r"""Draw interpolation coefficients for one synthetic-prior row.
+
+    The returned particle taus always have shape [N].  When ``draw_truth_tau=True`` a tau_star
+    is also returned for an independent population-law draw theta*.  For shared-tau modes,
+    tau_star is exactly the shared tau; for particle-wise modes it is an independent draw from
+    the SAME row-level tau law.
+
+    For a generic base draw Z with mean mu_0 and covariance Sigma_0, shared anchor a, and
+    particle-specific T independent of Z,
+
+        C = (1-T) Z + T a.
+
+    Conditional on a and the row-level law of T, with m=E[T] and v=Var(T),
+
+        E[C | a]   = mu_0 + m (a-mu_0),
+        Cov[C | a] = ((1-m)^2 + v) Sigma_0
+                     + v (a-mu_0)(a-mu_0)^T.
+
+    Hence iid Uniform[0,1] gives m=1/2, v=1/12.  For the hierarchical Beta construction,
+    T|m ~ Beta(kappa*m,kappa*(1-m)), so Var(T|m)=m(1-m)/(kappa+1).
+
+    The full particle-wise population law is generally a location/scale mixture rather than the
+    original base family.  We do not need its density: exact ancestral sampling of theta* uses
+    a fresh (T_star,Z_star) from the same row-level law.
+    """
+    n_particles = int(n_particles)
+    if n_particles < 1:
+        raise ValueError("n_particles must be >= 1 when constructing a synthetic prior cloud.")
+
+    mode = cfg.interpolation_tau_mode.strip().lower()
+    n_total = n_particles + int(bool(draw_truth_tau))
+
+    if mode == "shared_uniform":
+        tau = float(rng.uniform(0.0, 1.0))
+        taus = np.full(n_particles, tau, dtype=np.float32)
+        info = {"mode": mode, "tau_mean": tau, "tau_var": 0.0, "particlewise": False}
+        return taus, (tau if draw_truth_tau else None), info
+
+    if mode == "shared_logit_normal":
+        z = float(rng.normal(cfg.interpolation_logit_normal_loc, cfg.interpolation_logit_normal_scale))
+        tau = float(1.0 / (1.0 + np.exp(-z)))
+        taus = np.full(n_particles, tau, dtype=np.float32)
+        info = {"mode": mode, "tau_mean": tau, "tau_var": 0.0, "particlewise": False}
+        return taus, (tau if draw_truth_tau else None), info
+
+    if mode == "shared_beta":
+        tau = float(rng.beta(cfg.interpolation_shared_beta_alpha, cfg.interpolation_shared_beta_beta))
+        taus = np.full(n_particles, tau, dtype=np.float32)
+        info = {"mode": mode, "tau_mean": tau, "tau_var": 0.0, "particlewise": False}
+        return taus, (tau if draw_truth_tau else None), info
+
+    if mode == "iid_uniform":
+        draws = rng.uniform(0.0, 1.0, size=n_total).astype(np.float32)
+        taus = draws[:n_particles]
+        tau_star = float(draws[-1]) if draw_truth_tau else None
+        info = {
+            "mode": mode,
+            "tau_mean": 0.5,
+            "tau_var": 1.0 / 12.0,
+            "particlewise": True,
+        }
+        return taus, tau_star, info
+
+    if mode == "hierarchical_beta":
+        m = float(rng.uniform(cfg.interpolation_tau_mean_low, cfg.interpolation_tau_mean_high))
+        kappa = float(cfg.interpolation_tau_concentration)
+        alpha = kappa * m
+        beta = kappa * (1.0 - m)
+        draws = rng.beta(alpha, beta, size=n_total).astype(np.float32)
+        taus = draws[:n_particles]
+        tau_star = float(draws[-1]) if draw_truth_tau else None
+        info = {
+            "mode": mode,
+            "tau_mean": m,
+            "tau_var": m * (1.0 - m) / (kappa + 1.0),
+            "particlewise": True,
+            "cloud_tau_mean": m,
+        }
+        return taus, tau_star, info
+
+    raise ValueError(f"Unknown interpolation_tau_mode={cfg.interpolation_tau_mode!r}.")
+
+
+def _interpolation_tau_description(cfg: BayesTransportConfig = CFG) -> str:
+    """Compact human-readable description used in run metadata and console output."""
+    mode = cfg.interpolation_tau_mode.strip().lower()
+    if mode == "shared_uniform":
+        return "shared tau ~ Uniform[0,1]"
+    if mode == "shared_logit_normal":
+        return (
+            "shared tau = sigmoid(N("
+            f"{cfg.interpolation_logit_normal_loc:g},{cfg.interpolation_logit_normal_scale:g}^2))"
+        )
+    if mode == "shared_beta":
+        return (
+            "shared tau ~ Beta("
+            f"{cfg.interpolation_shared_beta_alpha:g},{cfg.interpolation_shared_beta_beta:g})"
+        )
+    if mode == "iid_uniform":
+        return "particle-wise tau_n iid Uniform[0,1]"
+    if mode == "hierarchical_beta":
+        return (
+            "m ~ Uniform("
+            f"{cfg.interpolation_tau_mean_low:g},{cfg.interpolation_tau_mean_high:g}); "
+            "tau_n|m ~ Beta(kappa*m,kappa*(1-m)), "
+            f"kappa={cfg.interpolation_tau_concentration:g}"
+        )
+    return mode
+
+
 def sample_interpolated_training_prior_and_truth_np(
     rng: np.random.Generator,
     n_particles: int,
@@ -585,16 +714,32 @@ def sample_interpolated_training_prior_and_truth_np(
     num_sources: int,
     source_dim: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    r"""Sample the only retained synthetic training law: shared-tau interpolation.
+    r"""Sample one synthetic training prior cloud and the actual observation truth.
 
-    1. theta* ~ rho_0 is the observation-generating truth.
-    2. The interpolation anchor equals theta* with probability ``synthetic_prior_match_probability``;
-       otherwise it is an independent draw from rho_0.
-    3. Z_n iid ~ rho_0 and one tau ~ Uniform[0,1] is shared by every particle.
-    4. C_tau,n = (1-tau) Z_n + tau * anchor.
+    The CPU sampling order follows the experiment described at the top of this file:
+      1. z_n iid ~ rho_0 and theta_tilde ~ rho_0;
+      2. draw tau_n according to ``interpolation_tau_mode``;
+      3. C = {(1-tau_n) z_n + tau_n theta_tilde}_n;
+      4. choose theta* according to ``synthetic_truth_sampling_mode``.
 
-    This exposes every training mode to concentrated and misspecified versions of the same base
-    prior while keeping the prior-cloud design deliberately minimal.
+    Shared-tau modes retain the historical construction.  In ``closed_form`` truth mode they
+    retain the exact old conditional law because theta* uses the same shared tau.
+
+    For ``iid_uniform`` and ``hierarchical_beta``, the particles are iid conditional on the
+    anchor and row-level tau law but are no longer Gaussian/Uniform as a marginal family after
+    integrating out tau_n.  Nevertheless their population law is exactly sampleable:
+
+        Z* ~ rho_0,
+        T* ~ the same row-level tau law independently,
+        theta* = (1-T*) Z* + T* theta_tilde.
+
+    Thus no likelihood weighting, SMC, or empirical approximation is needed to create the prior
+    or the closed-form-mode truth.  The physical likelihood is still used only AFTER theta* has
+    been generated.
+
+    ``empirical`` deliberately retains this script's historical cloud-mean + Gaussian-jitter
+    surrogate branch rather than silently changing an existing ablation.
+    ``bernoulli_choice`` also retains its historical matched/misspecified truth construction.
     """
     S = int(num_sources)
     D = int(source_dim)
@@ -602,24 +747,67 @@ def sample_interpolated_training_prior_and_truth_np(
     if n_particles < 1:
         raise ValueError("n_particles must be >= 1 when constructing a synthetic prior cloud.")
 
-    theta_true = sample_base_prior_np(
-        rng, 1, cfg, num_sources=S, source_dim=D
-    )[0]
-    if rng.random() < cfg.synthetic_prior_match_probability:
-        anchor = theta_true.copy()
-    else:
-        anchor = sample_base_prior_np(
-            rng, 1, cfg, num_sources=S, source_dim=D
-        )[0]
-
     base_particles = sample_base_prior_np(
         rng, n_particles, cfg, num_sources=S, source_dim=D
     )
-    tau = np.float32(rng.uniform(0.0, 1.0))
+    potential_theta = sample_base_prior_np(
+        rng, 1, cfg, num_sources=S, source_dim=D
+    )[0]
+
+    mode = cfg.synthetic_truth_sampling_mode
+    particle_taus, tau_star, _tau_info = _sample_interpolation_taus_np(
+        rng,
+        n_particles,
+        cfg,
+        draw_truth_tau=(mode == "closed_form"),
+    )
+    tau_view = particle_taus[:, None, None].astype(np.float32)
     prior_particles = (
-        (np.float32(1.0) - tau) * base_particles + tau * anchor[None, :, :]
+        (np.float32(1.0) - tau_view) * base_particles
+        + tau_view * potential_theta[None, :, :]
     ).astype(np.float32)
+
+    if mode == "closed_form":
+        # Exact ancestral draw from the same row-level interpolation population as one cloud
+        # particle.  This works for BOTH configured base priors and for shared or particle-wise
+        # tau laws; no analytic mixture density is required.
+        if tau_star is None:
+            raise RuntimeError("closed_form truth sampling requires a tau_star draw.")
+        base_truth = sample_base_prior_np(
+            rng, 1, cfg, num_sources=S, source_dim=D
+        )[0]
+        tau_star32 = np.float32(tau_star)
+        theta_true = (
+            (np.float32(1.0) - tau_star32) * base_truth
+            + tau_star32 * potential_theta
+        ).astype(np.float32)
+
+    elif mode == "empirical":
+        # Historical behaviour retained intentionally.  Despite the old label, this branch is
+        # a noisy approximation around the realised cloud mean rather than an exact empirical
+        # particle draw.  Keeping it unchanged avoids silently altering an existing ablation.
+        theta_true = (
+            np.mean(prior_particles, axis=0)
+            + rng.normal(0, 0.30, size=(S, D)).astype(np.float32)
+        )
+
+    elif mode == "bernoulli_choice":
+        # Historical ablation retained verbatim: either use the contraction centre itself
+        # or deliberately mismatch the observations with an independent base-prior truth.
+        use_potential = bool(rng.random() < cfg.synthetic_prior_match_probability)
+        if use_potential:
+            theta_true = potential_theta.copy()
+        else:
+            theta_true = sample_base_prior_np(
+                rng, 1, cfg, num_sources=S, source_dim=D
+            )[0]
+    else:
+        raise ValueError(
+            "synthetic_truth_sampling_mode must be 'closed_form', 'empirical', or 'bernoulli_choice'."
+        )
+
     return prior_particles, np.asarray(theta_true, dtype=np.float32)
+
 
 
 def sample_interpolated_prior_given_truth_np(
@@ -631,23 +819,39 @@ def sample_interpolated_prior_given_truth_np(
     num_sources: int,
     source_dim: int,
 ) -> np.ndarray:
-    """Sample C_tau conditional on an already supplied theta* under the retained shared-tau law."""
+    """Legacy helper: sample C_tau conditional on an already-generated base-prior theta*.
+
+    This is the conditional form of ONLY the historical `bernoulli_choice` training law.
+    With probability p the synthetic potential theta is the supplied theta*; otherwise it is
+    an independent base-prior draw. Fresh z_n and the configured interpolation_tau_mode then build the cloud.
+    The current default closed-form/empirical validation paths store C_tau jointly with theta*
+    and therefore do not use this reverse conditional construction.
+    """
+    if cfg.synthetic_truth_sampling_mode != "bernoulli_choice":
+        raise ValueError(
+            "sample_interpolated_prior_given_truth_np is only valid for "
+            "synthetic_truth_sampling_mode='bernoulli_choice'."
+        )
     S = int(num_sources)
     D = int(source_dim)
-    theta_true = np.asarray(theta_true, dtype=np.float32)[:S, :D]
-    if rng.random() < cfg.synthetic_prior_match_probability:
-        anchor = theta_true
-    else:
-        anchor = sample_base_prior_np(
-            rng, 1, cfg, num_sources=S, source_dim=D
-        )[0]
     base_particles = sample_base_prior_np(
         rng, int(n_particles), cfg, num_sources=S, source_dim=D
     )
-    tau = np.float32(rng.uniform(0.0, 1.0))
+    if rng.random() < cfg.synthetic_prior_match_probability:
+        potential_theta = np.asarray(theta_true, dtype=np.float32)[:S, :D]
+    else:
+        potential_theta = sample_base_prior_np(
+            rng, 1, cfg, num_sources=S, source_dim=D
+        )[0]
+    particle_taus, _, _ = _sample_interpolation_taus_np(
+        rng, int(n_particles), cfg, draw_truth_tau=False
+    )
+    tau_view = particle_taus[:, None, None].astype(np.float32)
     return (
-        (np.float32(1.0) - tau) * base_particles + tau * anchor[None, :, :]
+        (np.float32(1.0) - tau_view) * base_particles
+        + tau_view * potential_theta[None, :, :]
     ).astype(np.float32)
+
 
 def _base_prior_plot_extent(cfg: BayesTransportConfig = CFG) -> float:
     """Natural one-coordinate plotting extent for the configured t=0 prior."""
@@ -845,8 +1049,9 @@ def simulate_iid_joint_samples(
     """Generate a fixed iid validation set from the SAME joint law as the training dataloader.
 
     Each row independently draws (S,D), C_tau, theta*, designs, and observation noise using
-    `sample_interpolated_training_prior_and_truth_np`. C_tau is stored jointly with theta* so the
-    validation set uses exactly the same realised cloud on every epoch.
+    `sample_interpolated_training_prior_and_truth_np`.  Storing C_tau together with theta* is
+    important for the closed-form and empirical truth modes: in those modes the correct
+    conditional prior cloud cannot in general be reconstructed later from theta* alone.
 
     The Omax observations are multiple conditioning prefixes of the SAME iid joint datum,
     not recurrent posterior states.  A fixed NumPy seed makes this entire validation joint
@@ -925,8 +1130,9 @@ def make_iid_batch_np(
     """Create one direct iid validation minibatch without changing its sampled joint law.
 
     Current validation datasets store the synthetic C_tau drawn jointly with theta* and Y,
-    so this helper normally only slices those arrays. Legacy datasets without stored clouds can
-    still reconstruct C_tau exactly from theta* under the retained shared-tau/match law.
+    so this helper normally only slices those arrays.  The old reverse-conditional cloud
+    reconstruction is retained solely for legacy datasets when
+    `synthetic_truth_sampling_mode="bernoulli_choice"`.
     """
     indices = np.asarray(indices, dtype=np.int64)
     n_particles = cfg.num_particles if num_particles is None else int(num_particles)
@@ -948,8 +1154,14 @@ def make_iid_batch_np(
             )
         prior_particles = stored_prior
     else:
-        # Backward compatibility for old validation dictionaries. The retained shared-tau law
-        # has an exact conditional construction given theta*.
+        # Backward compatibility for old validation dictionaries.  This conditional
+        # reconstruction is exact only for the historical Bernoulli matched/mismatched law.
+        if cfg.synthetic_truth_sampling_mode != "bernoulli_choice":
+            raise ValueError(
+                "An iid validation dataset without stored prior_particles can only be used with "
+                "synthetic_truth_sampling_mode='bernoulli_choice'. Regenerate validation data "
+                "for closed_form or empirical truth sampling."
+            )
         batch_size = len(indices)
         prior_particles = np.zeros(
             (batch_size, n_particles, cfg.max_num_sources, cfg.max_source_dim),
@@ -1127,15 +1339,12 @@ def _flatten_used_observation_prefix_np(
 
 
 class ContinuousJointDataset(IterableDataset):
-    """Infinite CPU stream of fresh simulator data plus one synthetic interpolated prior cloud.
+    """Infinite CPU stream of fresh iid data plus one synthetic interpolated prior cloud.
 
-    ``energy_score`` and ``drifting`` each receive an ordinary iid row: one theta*, one Omax
-    observation block, and one C_tau cloud. Historical-output replay is applied later in the host
-    training loop because it depends on model outputs from previous optimizer steps.
-
-    ``deq_fixed_point`` instead receives one theta*, one C_tau cloud, and
-    ``training_fixed_point_max_iterations`` conditionally independent observation blocks from that
-    same theta*. Posterior clouds are never generated in the dataloader.
+    Each yielded row follows the six-step algorithm at the top of this file.  In particular,
+    the synthetic interpolation anchor and tau variables are sampled and consumed locally;
+    only the actual theta*, its Omax observations, the resulting input cloud, and shape
+    metadata are yielded.  There is no training trajectory and no posterior carry.
     """
 
     def __init__(self, cfg: BayesTransportConfig, *, seed: int):
@@ -1147,12 +1356,6 @@ class ContinuousJointDataset(IterableDataset):
         worker = get_worker_info()
         worker_id = 0 if worker is None else int(worker.id)
         rng = np.random.default_rng(self.seed + 1_000_003 * worker_id)
-        recurrent_training = self.cfg.training_mode == "deq_fixed_point"
-        training_steps = (
-            int(self.cfg.training_fixed_point_max_iterations)
-            if recurrent_training else 1
-        )
-
         while True:
             sampled_sources, sampled_theta_size = _sample_problem_shapes_np(
                 rng, 1, self.cfg, shape_pool=TRAIN_SHAPES
@@ -1168,33 +1371,22 @@ class ContinuousJointDataset(IterableDataset):
                 num_sources=S,
                 source_dim=D,
             )
-
             designs = rng.uniform(
                 self.cfg.design_low,
                 self.cfg.design_high,
-                size=(training_steps, self.cfg.max_observations_per_step, D),
+                size=(self.cfg.max_observations_per_step, D),
             ).astype(np.float32)
             mean = source_log_mean_np(theta_active, designs, self.cfg)
             readings = (
                 mean + self.cfg.observation_noise_std * rng.normal(size=mean.shape)
             ).astype(np.float32)
 
-            observation_trajectory = np.zeros(
-                (
-                    training_steps,
-                    self.cfg.max_observations_per_step,
-                    self.cfg.max_source_dim + 1,
-                ),
+            observations = np.zeros(
+                (self.cfg.max_observations_per_step, self.cfg.max_source_dim + 1),
                 dtype=np.float32,
             )
-            observation_trajectory[:, :, :D] = designs
-            observation_trajectory[:, :, -1] = readings
-            observations = (
-                observation_trajectory
-                if recurrent_training
-                else observation_trajectory[0]
-            )
-
+            observations[:, :D] = designs
+            observations[:, -1] = readings
             yield {
                 "theta_true": pad_theta_np(theta_active, self.cfg),
                 "observations": observations,
@@ -1202,104 +1394,6 @@ class ContinuousJointDataset(IterableDataset):
                 "theta_size": np.asarray(theta_size, dtype=np.int32),
                 "prior_particles": pad_theta_np(active_prior, self.cfg),
             }
-
-
-def _compact_cloud_to_padded_np(
-    compact_cloud: np.ndarray,
-    num_sources: int,
-    theta_size: int,
-    cfg: BayesTransportConfig,
-) -> np.ndarray:
-    """Inverse of compact_theta_jax for a whole N-particle cloud, on the host."""
-    compact_cloud = np.asarray(compact_cloud, dtype=np.float32)
-    S = int(num_sources)
-    theta_size = int(theta_size)
-    if compact_cloud.ndim != 2:
-        raise ValueError("compact replay cloud must have shape [N,Kmax].")
-    if S < 1 or theta_size < 1 or theta_size % S != 0:
-        raise ValueError("Invalid compact replay cloud metadata.")
-    D = theta_size // S
-    active = compact_cloud[:, :theta_size].reshape(compact_cloud.shape[0], S, D)
-    return pad_theta_np(active, cfg)
-
-
-class HistoricalOutputPriorBuffer:
-    """Bounded FIFO replay of detached model outputs for future energy/drifting rows.
-
-    Each entry carries only the past OUTPUT cloud, its theta*, and the EXACT observation block
-    used when that output was produced. Minimal S,D metadata is also retained because padded
-    heterogeneous clouds cannot be interpreted unambiguously from values alone. The original input
-    cloud is intentionally not stored. Replaying an entry therefore asks whether the model can take
-    its own previous output as a changed prior while seeing the same evidence again.
-    """
-
-    def __init__(self, capacity: int):
-        self.capacity = int(capacity)
-        if self.capacity < 1:
-            raise ValueError("Historical-output replay capacity must be >= 1.")
-        self._entries: deque[dict[str, np.ndarray | int]] = deque(maxlen=self.capacity)
-
-    def __len__(self) -> int:
-        return len(self._entries)
-
-    def add_batch(
-        self,
-        compact_clouds: np.ndarray,
-        batch_np: dict[str, np.ndarray],
-        cfg: BayesTransportConfig,
-    ) -> None:
-        """Store one final-prefix output cloud for every row in the just-trained minibatch."""
-        compact_clouds = np.asarray(compact_clouds, dtype=np.float32)
-        if compact_clouds.ndim != 3:
-            raise ValueError("replay outputs must have shape [B,N,Kmax].")
-        if compact_clouds.shape[0] != len(batch_np["theta_true"]):
-            raise ValueError("replay output batch dimension does not match training metadata.")
-        for b in range(compact_clouds.shape[0]):
-            S = int(np.asarray(batch_np["num_sources"][b]).item())
-            size = int(np.asarray(batch_np["theta_size"][b]).item())
-            self._entries.append({
-                # This is the model OUTPUT from the just-completed step. It is named
-                # prior_particles only because that is the input field it will occupy on replay.
-                "prior_particles": _compact_cloud_to_padded_np(
-                    compact_clouds[b], S, size, cfg
-                ).copy(),
-                "theta_true": np.asarray(batch_np["theta_true"][b], dtype=np.float32).copy(),
-                "observations": np.asarray(batch_np["observations"][b], dtype=np.float32).copy(),
-                "num_sources": S,
-                "theta_size": size,
-            })
-
-    def mix_into_batch(
-        self,
-        batch_np: dict[str, np.ndarray],
-        rng: np.random.Generator,
-        cfg: BayesTransportConfig,
-    ) -> tuple[dict[str, np.ndarray], int]:
-        """Replace selected C_tau rows by historical outputs and reuse their exact evidence."""
-        if len(self) == 0 or cfg.historical_output_prior_probability <= 0.0:
-            return batch_np, 0
-        observations = np.asarray(batch_np["observations"])
-        if observations.ndim != 3:
-            raise ValueError(
-                "Historical-output replay is only defined for one-step energy_score/drifting "
-                "training batches [B,Omax,Dmax+1]."
-            )
-
-        mixed = {name: np.array(value, copy=True) for name, value in batch_np.items()}
-        use_history = rng.random(len(mixed["theta_true"])) < cfg.historical_output_prior_probability
-        selected = np.flatnonzero(use_history)
-        for b in selected:
-            entry = self._entries[int(rng.integers(0, len(self._entries)))]
-            mixed["prior_particles"][b] = np.asarray(entry["prior_particles"], dtype=np.float32)
-            mixed["theta_true"][b] = np.asarray(entry["theta_true"], dtype=np.float32)
-            S = int(entry["num_sources"])
-            size = int(entry["theta_size"])
-            mixed["num_sources"][b] = np.asarray(S, dtype=np.int32)
-            mixed["theta_size"][b] = np.asarray(size, dtype=np.int32)
-            mixed["observations"][b] = np.asarray(
-                entry["observations"], dtype=np.float32
-            )
-        return mixed, int(selected.size)
 
 
 def _numpy_collate(samples: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
@@ -1317,7 +1411,7 @@ def make_continuous_train_loader(
     *,
     seed: int,
 ) -> DataLoader:
-    """Build the continuous loader; only DEQ rows contain a fresh-observation trajectory."""
+    """Build the infinite iid joint-sample DataLoader used by the JAX training loop."""
     dataset = ContinuousJointDataset(cfg, seed=seed)
     kwargs: dict[str, Any] = {
         "dataset": dataset,
@@ -1428,39 +1522,36 @@ def _masked_mean(tokens: Array, valid: Array) -> Array:
 
 
 class FixedShapeObservationEmbedder(eqx.Module):
-    """Fixed-shape observation normalizer with an optional one-layer learned projection."""
+    """Parameter-free fixed-shape observation preprocessor.
 
-    projection: eqx.nn.Linear | None
+    When both S and D are fixed there is no dimension-aggregation problem to solve.
+    The active physical (design, outcome) vector therefore remains width D+1 and is
+    passed directly to the causal likelihood Transformer after the same deterministic
+    normalization used by the heterogeneous embedder.  This module owns NO arrays and
+    consequently contributes exactly zero learnable parameters.
+    """
+
     design_scale: float = eqx.field(static=True)
     y_center: float = eqx.field(static=True)
     y_scale: float = eqx.field(static=True)
     source_dim: int = eqx.field(static=True)
-    output_dim: int = eqx.field(static=True)
 
     def __init__(self, cfg: BayesTransportConfig, *, key: Array):
+        del key
         self.design_scale = max(abs(cfg.design_low), abs(cfg.design_high), 1.0)
         self.y_center = cfg.y_center
         self.y_scale = max(cfg.y_scale, 1e-6)
         self.source_dim = cfg.max_source_dim
-        if cfg.fixed_shape_learned_projection:
-            self.projection = eqx.nn.Linear(
-                self.source_dim + 1, cfg.embedding_dim, key=key
-            )
-            self.output_dim = cfg.embedding_dim
-        else:
-            self.projection = None
-            self.output_dim = self.source_dim + 1
 
     def __call__(self, observation: Array, num_sources: Array, theta_size: Array) -> Array:
         del num_sources, theta_size
-        values = jnp.concatenate(
+        return jnp.concatenate(
             [
                 observation[: self.source_dim] / self.design_scale,
                 (observation[-1:] - self.y_center) / self.y_scale,
             ],
             axis=-1,
         )
-        return values if self.projection is None else self.projection(values)
 
 
 class ObservationDimensionEmbedder(eqx.Module):
@@ -1555,17 +1646,23 @@ class ObservationDimensionEmbedder(eqx.Module):
 
 
 class FixedShapeThetaEmbedder(eqx.Module):
-    """Fixed-shape theta normalizer with an optional one-layer learned projection."""
+    """Parameter-free fixed-shape physical-theta preprocessor.
 
-    projection: eqx.nn.Linear | None
+    The fixed active [S,D] block is flattened directly to width S*D.  There is no
+    learned scalar encoder, projection, Transformer, positional pool, or padding mask.
+    Optional source canonicalization is preserved.  A deterministic scale keeps the
+    numerical range comparable between Uniform and Gaussian base-prior experiments,
+    but this module owns NO arrays and contributes exactly zero learnable parameters.
+    """
+
     num_sources: int = eqx.field(static=True)
     source_dim: int = eqx.field(static=True)
     theta_center: float = eqx.field(static=True)
     theta_scale: float = eqx.field(static=True)
     canonicalize: bool = eqx.field(static=True)
-    output_dim: int = eqx.field(static=True)
 
     def __init__(self, cfg: BayesTransportConfig, *, key: Array):
+        del key
         self.num_sources = cfg.max_num_sources
         self.source_dim = cfg.max_source_dim
         if cfg.base_prior_distribution == "uniform":
@@ -1575,21 +1672,13 @@ class FixedShapeThetaEmbedder(eqx.Module):
             self.theta_center = 0.0
             self.theta_scale = max(cfg.prior_std, 1e-6)
         self.canonicalize = cfg.canonicalize_particle_sources
-        physical_dim = self.num_sources * self.source_dim
-        if cfg.fixed_shape_learned_projection:
-            self.projection = eqx.nn.Linear(physical_dim, cfg.embedding_dim, key=key)
-            self.output_dim = cfg.embedding_dim
-        else:
-            self.projection = None
-            self.output_dim = physical_dim
 
     def __call__(self, theta: Array, num_sources: Array, theta_size: Array) -> Array:
         del theta_size
         if self.canonicalize:
             theta = canonicalize_padded_sources_jax(theta, num_sources)
         values = theta[: self.num_sources, : self.source_dim].reshape(-1)
-        values = (values - self.theta_center) / self.theta_scale
-        return values if self.projection is None else self.projection(values)
+        return (values - self.theta_center) / self.theta_scale
 
 
 class ThetaDimensionEmbedder(eqx.Module):
@@ -1968,9 +2057,6 @@ class ThetaParticleOutputHead(eqx.Module):
             cfg.max_num_sources * cfg.max_source_dim,
             key=key,
         )
-        # Preserve the historical identity-at-initialisation transport for every mode. In the
-        # augmented DEQ, J_F is strictly lower triangular across time, so I-J_F remains invertible
-        # even when the one-step transport initially equals the identity.
         output = eqx.tree_at(lambda layer: layer.weight, output, jnp.zeros_like(output.weight))
         output = eqx.tree_at(lambda layer: layer.bias, output, jnp.zeros_like(output.bias))
         self.displacement_head = output
@@ -2104,15 +2190,14 @@ class AdaLNPosteriorTransformer(eqx.Module):
         return self.output_head(particles, current_theta, theta_size)
 
 
-#%% 8) End-to-end amortized model with reusable sequential recurrence
+#%% 8) End-to-end amortized model with evaluation-only sequential recurrence
 class SequentialBayesModel(eqx.Module):
-    """Direct amortized transport plus a reusable repeated-Bayes rollout.
+    """Direct amortized transport plus an evaluation-only repeated-Bayes rollout.
 
-    `predict_prefixes` remains the historical direct one-step path. `_transport_compact_with_contexts`
-    is the shared Bayes-update cell used by all modes. `__call__` performs a recurrent rollout in
-    which observation block t is used exactly at update t; it is used by sequential evaluation.
-    DEQ training wraps the same cell in an augmented-trajectory equilibrium. Drifting training is
-    deliberately one-step and therefore uses `predict_prefixes`, not this recurrent `__call__`.
+    `predict_prefixes` is the ONLY path used by the training loss.  It maps one supplied
+    synthetic input cloud to posterior clouds for every o=Omin,...,Omax in parallel.  `__call__`
+    retains the historical sequential interface for diagnostics and repeatedly applies the
+    same learned direct map to a current cloud; no gradient step trains through that recurrence.
     """
 
     observation_embedder: ObservationDimensionEmbedder | FixedShapeObservationEmbedder
@@ -2124,7 +2209,6 @@ class SequentialBayesModel(eqx.Module):
     max_observations: int = eqx.field(static=True)
     conditioning_type: str = eqx.field(static=True)
     fixed_shape: bool = eqx.field(static=True)
-    fixed_shape_learned_projection: bool = eqx.field(static=True)
     particle_input_dim: int = eqx.field(static=True)
     observation_input_dim: int = eqx.field(static=True)
     observation_context_dim: int = eqx.field(static=True)
@@ -2141,18 +2225,17 @@ class SequentialBayesModel(eqx.Module):
         self.single_observation_direct = (
             self.min_observations == 1 and self.max_observations == 1
         )
-        self.fixed_shape_learned_projection = bool(
-            self.fixed_shape and cfg.fixed_shape_learned_projection
-        )
         if self.fixed_shape:
-            # Bypass the full dimension aggregators. Optionally use exactly one learned linear
-            # projection for each fixed-shape input so both paths live in embedding_dim.
+            # No learned dimension aggregation is needed.  Physical theta samples enter the
+            # Posterior Transformer from width S*D.  Observations remain at physical width D+1;
+            # with one observation they go straight through the zero-parameter likelihood bypass,
+            # otherwise they enter the likelihood Transformer's learned input projection.
+            self.particle_input_dim = cfg.max_num_sources * cfg.max_source_dim
+            self.observation_input_dim = cfg.max_source_dim + 1
             self.observation_embedder = FixedShapeObservationEmbedder(
                 cfg, key=observation_key
             )
             self.theta_embedder = FixedShapeThetaEmbedder(cfg, key=theta_key)
-            self.particle_input_dim = self.theta_embedder.output_dim
-            self.observation_input_dim = self.observation_embedder.output_dim
         else:
             self.particle_input_dim = cfg.embedding_dim
             self.observation_input_dim = cfg.embedding_dim
@@ -2262,39 +2345,6 @@ class SequentialBayesModel(eqx.Module):
             lambda theta: compact_theta_jax(theta, num_sources, theta_size)
         )(padded)
 
-    def _transport_compact_with_contexts(
-        self,
-        current_theta: Array,          # [N,Kmax]
-        observation_contexts: Array,
-        observation_count: Array,
-        num_sources: Array,
-        theta_size: Array,
-        max_num_sources: int,
-        max_source_dim: int,
-    ) -> Array:
-        """Apply one Bayes-map step to an already compact cloud using precomputed contexts."""
-        current_embeddings = self._embed_compact_cloud(
-            current_theta,
-            num_sources,
-            theta_size,
-            max_num_sources,
-            max_source_dim,
-        )
-        next_theta = self.posterior_transformer(
-            current_embeddings,
-            current_theta,
-            observation_contexts,
-            observation_count,
-            theta_size,
-        )
-        return self._canonicalize_compact_output(
-            next_theta,
-            num_sources,
-            theta_size,
-            max_num_sources,
-            max_source_dim,
-        )
-
     def predict_prefixes(
         self,
         prior_particles: Array,       # [N,Smax,Dmax]
@@ -2352,7 +2402,7 @@ class SequentialBayesModel(eqx.Module):
         num_sources: Array,
         theta_size: Array,
     ) -> tuple[Array, Array, Array]:
-        """Sequential rollout: feed each output cloud to the next DISTINCT observation block."""
+        """Evaluation-only sequential rollout by repeatedly applying the learned Bayes map."""
         prior_theta = self._compact_reference_cloud(prior_particles, num_sources, theta_size)
         observation_contexts = jax.vmap(
             lambda block: self._encode_observation_block(block, num_sources, theta_size)
@@ -2399,16 +2449,10 @@ def print_model_parameter_count(model: SequentialBayesModel):
     posterior = count_parameters(model.posterior_transformer)
 
     total = observation_embedder + likelihood_embedder + theta_embedder + posterior
-    if model.fixed_shape and not model.fixed_shape_learned_projection:
-        if observation_embedder != 0 or theta_embedder != 0:
-            raise RuntimeError(
-                "Fixed-shape projection is disabled, so both input embedders must be parameter-free."
-            )
-    if model.fixed_shape_learned_projection:
-        if observation_embedder == 0 or theta_embedder == 0:
-            raise RuntimeError(
-                "Fixed-shape learned projection is enabled, but an input projection has no parameters."
-            )
+    if model.fixed_shape and (observation_embedder != 0 or theta_embedder != 0):
+        raise RuntimeError(
+            "Fixed-shape input embedders must contain zero learnable parameters."
+        )
     if model.single_observation_direct and likelihood_embedder != 0:
         raise RuntimeError(
             "Omin=Omax=1 requires the retained Likelihood Transformer to have zero parameters."
@@ -2422,9 +2466,8 @@ def print_model_parameter_count(model: SequentialBayesModel):
     print(f"  Theta embedder          : {theta_embedder:,}")
     print(f"  Posterior Transformer   : {posterior:,}")
     if model.fixed_shape:
-        projection_label = "learned linear -> E" if model.fixed_shape_learned_projection else "parameter-free physical"
         print(
-            f"  Fixed-shape input interface: {projection_label}; "
+            "  Fixed-shape direct input widths: "
             f"theta={model.particle_input_dim}, observation={model.observation_input_dim}; "
             f"posterior conditioning context={model.observation_context_dim}"
         )
@@ -2540,7 +2583,7 @@ def _trajectory_metrics(
     target_theta: Array,
     theta_size: Array,
 ) -> tuple[Array, Array, Array]:
-    """Vectorise empirical-cloud diagnostics over a sequential cloud trajectory."""
+    """Vectorise reporting metrics over an evaluation-only sequential trajectory."""
     energy = jax.vmap(lambda p: energy_score_single(p, target_theta, theta_size))(
         posterior_sequence
     )
@@ -2551,12 +2594,30 @@ def _trajectory_metrics(
     return energy, rmse, spread
 
 
-def _direct_prediction_and_metrics(
+def batch_objective(
     model: SequentialBayesModel,
     batch: dict[str, Array],
     cfg: BayesTransportConfig = CFG,
 ) -> tuple[Array, dict[str, Array]]:
-    """Original direct one-step prediction and exact empirical-energy diagnostics."""
+    """Non-sequential iid empirical-energy-score training objective.
+
+    Every batch row contains one jointly generated (C_tau,theta*,Y) sample from the configured
+    synthetic training law.  The relationship between C_tau and theta* is selected by
+    synthetic_truth_sampling_mode.  With Omin=Omax=1 the likelihood Transformer is an exact
+    zero-parameter identity bypass; otherwise the causal observation encoder is evaluated once.
+    The direct Posterior Transformer is vmapped over every
+    o=Omin,...,Omax.  Crucially, every prefix starts from that SAME C_tau; no posterior output
+    is fed into another training prefix.
+
+    For a fixed row and prefix the model output is the empirical predictive measure Q_hat, and
+    we optimize ES(Q_hat,theta*) directly.  The relevant proper-score target is therefore the
+    conditional law Law(theta* | C_tau, Y_1:o) induced by the explicitly defined synthetic
+    training experiment.  We do not invoke the independent-reference-cloud identity here,
+    because the configured synthetic construction can make C_tau informative about theta*.
+
+    No independence assumption on transported particles is required because Q_hat itself is
+    the reported empirical distribution being scored.
+    """
     predicted, _, _, prefix_counts = jax.vmap(
         lambda prior, observations, sources, size: model.predict_prefixes(
             prior, observations, sources, size
@@ -2567,15 +2628,18 @@ def _direct_prediction_and_metrics(
         batch["num_sources"],
         batch["theta_size"],
     )
+
     target_theta = _compact_targets(
         batch["theta_true"], batch["num_sources"], batch["theta_size"], cfg
     )
     energy, attraction, repulsion, rmse, spread = jax.vmap(_prefix_metrics)(
         predicted, target_theta, batch["theta_size"]
     )
+
+    loss = jnp.mean(energy)
     metrics = {
-        "loss": jnp.mean(energy),
-        "energy_score": jnp.mean(energy),
+        "loss": loss,
+        "energy_score": loss,
         "final_energy_score": jnp.mean(energy[:, -1]),
         "posterior_mean_rmse": jnp.mean(rmse),
         "final_mean_rmse": jnp.mean(rmse[:, -1]),
@@ -2588,690 +2652,7 @@ def _direct_prediction_and_metrics(
         "spread_by_o": jnp.mean(spread, axis=0),
         "prefix_counts": prefix_counts[0],
     }
-    return predicted, metrics
-
-
-def _fixed_point_relative_residual(x: Array, fx: Array) -> Array:
-    diff = fx - x
-    numerator = jnp.sqrt(jnp.mean(jnp.square(diff)))
-    denominator = jnp.maximum(
-        jnp.maximum(jnp.sqrt(jnp.mean(jnp.square(x))), jnp.sqrt(jnp.mean(jnp.square(fx)))),
-        jnp.asarray(1.0, dtype=x.dtype),
-    )
-    return numerator / denominator
-
-
-def _solve_fixed_point(
-    fn,
-    initial: Array,
-    *,
-    solver: str,
-    max_steps: int,
-    tolerance: float,
-    relaxation: float,
-    anderson_history: int,
-    anderson_ridge: float,
-) -> tuple[Array, Array, Array]:
-    """Generic array fixed-point solver used in both DEQ forward and implicit VJP passes."""
-    solver = str(solver)
-    max_steps = int(max_steps)
-    tol = jnp.asarray(tolerance, dtype=initial.dtype)
-    relax = jnp.asarray(relaxation, dtype=initial.dtype)
-
-    if solver == "picard":
-        f0 = fn(initial)
-        r0 = _fixed_point_relative_residual(initial, f0)
-        init = (jnp.asarray(0, dtype=jnp.int32), initial, f0, r0)
-
-        def cond(carry):
-            step, _x, _fx, residual = carry
-            return jnp.logical_and(step < max_steps, residual > tol)
-
-        def body(carry):
-            step, x, fx, _residual = carry
-            x_next = x + relax * (fx - x)
-            fx_next = fn(x_next)
-            residual_next = _fixed_point_relative_residual(x_next, fx_next)
-            return step + 1, x_next, fx_next, residual_next
-
-        step, x, _fx, residual = eqx.internal.while_loop(
-            cond, body, init, max_steps=max_steps, kind="lax"
-        )
-        return x, step, residual
-
-    if solver != "anderson":
-        raise ValueError(f"Unknown fixed-point solver {solver!r}.")
-
-    history = int(anderson_history)
-    flat_size = initial.size
-    x_hist0 = jnp.zeros((history, flat_size), dtype=initial.dtype)
-    f_hist0 = jnp.zeros((history, flat_size), dtype=initial.dtype)
-    f0 = fn(initial)
-    r0 = _fixed_point_relative_residual(initial, f0)
-    init = (
-        jnp.asarray(0, dtype=jnp.int32), initial, f0, r0, x_hist0, f_hist0
-    )
-    eye = jnp.eye(history, dtype=initial.dtype)
-    ridge = jnp.asarray(anderson_ridge, dtype=initial.dtype)
-
-    def cond(carry):
-        step, _x, _fx, residual, _xh, _fh = carry
-        return jnp.logical_and(step < max_steps, residual > tol)
-
-    def body(carry):
-        step, x, fx, _residual, x_hist, f_hist = carry
-        slot = jnp.mod(step, history)
-        x_hist = x_hist.at[slot].set(x.reshape(-1))
-        f_hist = f_hist.at[slot].set(fx.reshape(-1))
-        valid_count = jnp.minimum(step + 1, history)
-        valid = (jnp.arange(history) < valid_count).astype(initial.dtype)
-        g = (f_hist - x_hist) * valid[:, None]
-        gram = g @ g.T + ridge * eye
-        # Unused history rows are decoupled and forced to zero coefficient.
-        gram = gram + (1.0 - valid)[:, None] * eye
-        rhs = valid
-        alpha = jnp.linalg.solve(gram, rhs)
-        alpha = alpha * valid
-        alpha = alpha / jnp.maximum(jnp.sum(alpha), jnp.asarray(1e-12, dtype=alpha.dtype))
-        x_mix = jnp.sum(alpha[:, None] * x_hist, axis=0).reshape(initial.shape)
-        f_mix = jnp.sum(alpha[:, None] * f_hist, axis=0).reshape(initial.shape)
-        accelerated = (jnp.asarray(1.0, dtype=initial.dtype) - relax) * x_mix + relax * f_mix
-        f_next = fn(accelerated)
-        residual_next = _fixed_point_relative_residual(accelerated, f_next)
-        return step + 1, accelerated, f_next, residual_next, x_hist, f_hist
-
-    step, x, _fx, residual, _xh, _fh = eqx.internal.while_loop(
-        cond, body, init, max_steps=max_steps, kind="lax"
-    )
-    return x, step, residual
-
-
-def _deq_trajectory_operator(
-    model: SequentialBayesModel,
-    trajectory_state: Array,          # [T,N,Kmax]
-    initial_theta: Array,             # [N,Kmax]
-    observation_contexts: Array,      # [T,Omax,C]
-    observation_count: Array,
-    num_sources: Array,
-    theta_size: Array,
-    max_num_sources: int,
-    max_source_dim: int,
-) -> Array:
-    """Augmented DEQ operator for a recurrent Bayes trajectory with fresh evidence.
-
-    The fixed-point state is Z=(C_1,...,C_T). Its operator is triangular:
-
-        F(Z)_1 = T_phi(C_0, Y_1)
-        F(Z)_t = T_phi(C_{t-1}, Y_t),  t=2,...,T.
-
-    Therefore the equilibrium is exactly the T-step recurrent Bayes rollout, but it can be
-    differentiated with the implicit-function theorem as one augmented implicit layer. Every
-    temporal coordinate calls the shared model with a DIFFERENT observation block. The outer
-    root finder may reevaluate this deterministic augmented operator, so it reuses the pre-generated
-    trajectory Y_1:T across root-finder evaluations; it never substitutes the same Y inside two
-    different recurrent positions.
-    """
-    previous_clouds = jnp.concatenate(
-        [initial_theta[None, ...], trajectory_state[:-1]], axis=0
-    )
-
-    def mapped_step(inputs):
-        current_theta, contexts = inputs
-        return model._transport_compact_with_contexts(
-            current_theta,
-            contexts,
-            observation_count,
-            num_sources,
-            theta_size,
-            max_num_sources,
-            max_source_dim,
-        )
-
-    # lax.map intentionally serialises the temporal operator evaluations instead of creating a
-    # T-way batched Transformer VJP. This is slower than vmap but dramatically lowers peak memory.
-    return jax.lax.map(mapped_step, (previous_clouds, observation_contexts))
-
-
-def _deq_forward_impl(
-    model: SequentialBayesModel,
-    prior_particles: Array,
-    observations: Array,              # [T,Omax,Dmax+1]
-    observation_count: Array,
-    num_sources: Array,
-    theta_size: Array,
-    cfg: BayesTransportConfig,
-) -> tuple[Array, Array, Array, Array]:
-    """Solve the augmented T-observation equilibrium without constructing an autodiff tape."""
-    if observations.ndim != 3:
-        raise ValueError(
-            "deq_fixed_point training observations must have shape [T,Omax,Dmax+1]."
-        )
-    if observations.shape[0] != cfg.training_fixed_point_max_iterations:
-        raise ValueError(
-            "DEQ training observation trajectory length does not match "
-            "training_fixed_point_max_iterations."
-        )
-
-    initial_theta = model._compact_reference_cloud(prior_particles, num_sources, theta_size)
-    contexts = jax.lax.map(
-        lambda block: model._encode_observation_block(block, num_sources, theta_size),
-        observations,
-    )
-    max_num_sources = prior_particles.shape[-2]
-    max_source_dim = prior_particles.shape[-1]
-
-    if cfg.fixed_point_solver == "triangular":
-        # For F(Z)_t = T_phi(Z_{t-1},Y_t), with Z_{-1}=C_0, the augmented Jacobian is
-        # strictly lower triangular. A single causal scan therefore solves Z=F(Z) exactly.
-        # Because this function sits inside filter_custom_vjp's forward rule, JAX does NOT retain
-        # a backward tape through this scan; the custom implicit rule below supplies the VJP.
-        def scan_step(current_theta, current_contexts):
-            next_theta = model._transport_compact_with_contexts(
-                current_theta,
-                current_contexts,
-                observation_count,
-                num_sources,
-                theta_size,
-                max_num_sources,
-                max_source_dim,
-            )
-            return next_theta, next_theta
-
-        _final, equilibrium_trajectory = jax.lax.scan(
-            scan_step, initial_theta, contexts
-        )
-        steps = jnp.asarray(observations.shape[0], dtype=jnp.int32)
-        residual = jnp.asarray(0.0, dtype=initial_theta.dtype)
-        return equilibrium_trajectory, steps, residual, initial_theta
-
-    initial_state = jnp.broadcast_to(
-        initial_theta[None, ...],
-        (observations.shape[0],) + initial_theta.shape,
-    )
-
-    def trajectory_operator(state):
-        return _deq_trajectory_operator(
-            model,
-            state,
-            initial_theta,
-            contexts,
-            observation_count,
-            num_sources,
-            theta_size,
-            max_num_sources,
-            max_source_dim,
-        )
-
-    equilibrium_trajectory, steps, residual = _solve_fixed_point(
-        trajectory_operator,
-        initial_state,
-        solver=cfg.fixed_point_solver,
-        max_steps=cfg.fixed_point_max_steps,
-        tolerance=cfg.fixed_point_tolerance,
-        relaxation=cfg.fixed_point_relaxation,
-        anderson_history=cfg.fixed_point_anderson_history,
-        anderson_ridge=cfg.fixed_point_anderson_ridge,
-    )
-    return equilibrium_trajectory, steps, residual, initial_theta
-
-
-def _deq_triangular_implicit_model_vjp(
-    model: SequentialBayesModel,
-    equilibrium_trajectory: Array,
-    initial_theta: Array,
-    observations: Array,
-    observation_count: Array,
-    num_sources: Array,
-    theta_size: Array,
-    max_num_sources: int,
-    max_source_dim: int,
-    grad_final: Array,
-):
-    """Exact low-memory IFT VJP for the causal augmented DEQ.
-
-    For the triangular equilibrium, (I-J_F^T)u=g is itself a reverse recurrence. We solve that
-    recurrence one Bayes update at a time and accumulate parameter VJPs. The one-step function is
-    rematerialized inside the reverse scan, so no T-step Transformer activation tape is retained.
-    This is algebraically the implicit VJP, not differentiation through the forward scan.
-    """
-    previous_clouds = jnp.concatenate(
-        [initial_theta[None, ...], equilibrium_trajectory[:-1]], axis=0
-    )
-    params, static_model = eqx.partition(model, eqx.is_inexact_array)
-    zero_grad_params = jax.tree_util.tree_map(jnp.zeros_like, params)
-
-    def reverse_step(carry, inputs):
-        cotangent, grad_params_accum = carry
-        previous_theta, observation_block = inputs
-
-        def one_update(candidate_params, candidate_previous):
-            candidate_model = eqx.combine(candidate_params, static_model)
-            candidate_contexts = candidate_model._encode_observation_block(
-                observation_block, num_sources, theta_size
-            )
-            return candidate_model._transport_compact_with_contexts(
-                candidate_previous,
-                candidate_contexts,
-                observation_count,
-                num_sources,
-                theta_size,
-                max_num_sources,
-                max_source_dim,
-            )
-
-        # remat avoids saving the Transformer forward activations for the local VJP.
-        rematerialized_update = jax.checkpoint(one_update)
-        _output, pullback = jax.vjp(
-            rematerialized_update, params, previous_theta
-        )
-        grad_params_step, grad_previous = pullback(cotangent)
-        grad_params_accum = jax.tree_util.tree_map(
-            lambda total, increment: total + increment,
-            grad_params_accum,
-            grad_params_step,
-        )
-        return (grad_previous, grad_params_accum), None
-
-    (_grad_initial, grad_params), _ = jax.lax.scan(
-        reverse_step,
-        (grad_final, zero_grad_params),
-        (previous_clouds[::-1], observations[::-1]),
-    )
-    return grad_params
-
-
-@eqx.filter_custom_vjp
-def deq_fixed_point_cloud(
-    model: SequentialBayesModel,
-    prior_particles: Array,
-    observations: Array,
-    observation_count: Array,
-    num_sources: Array,
-    theta_size: Array,
-    *,
-    cfg: BayesTransportConfig,
-) -> tuple[Array, Array, Array]:
-    trajectory, steps, residual, _initial_theta = _deq_forward_impl(
-        model, prior_particles, observations, observation_count, num_sources, theta_size, cfg
-    )
-    # Only the last recurrent cloud enters the DEQ training objective. Keeping T clouds out of
-    # the public output also prevents outer batch/prefix maps from materialising unnecessary data.
-    return trajectory[-1], steps, residual
-
-
-@deq_fixed_point_cloud.def_fwd
-def _deq_fixed_point_cloud_fwd(
-    perturbed,
-    model: SequentialBayesModel,
-    prior_particles: Array,
-    observations: Array,
-    observation_count: Array,
-    num_sources: Array,
-    theta_size: Array,
-    *,
-    cfg: BayesTransportConfig,
-):
-    del perturbed
-    trajectory, steps, residual, initial_theta = _deq_forward_impl(
-        model, prior_particles, observations, observation_count, num_sources, theta_size, cfg
-    )
-    # The residual contains only physical cloud states, not Transformer activations.
-    return (trajectory[-1], steps, residual), (trajectory, initial_theta)
-
-
-@deq_fixed_point_cloud.def_bwd
-def _deq_fixed_point_cloud_bwd(
-    residuals,
-    grad_obj,
-    perturbed,
-    model: SequentialBayesModel,
-    prior_particles: Array,
-    observations: Array,
-    observation_count: Array,
-    num_sources: Array,
-    theta_size: Array,
-    *,
-    cfg: BayesTransportConfig,
-):
-    equilibrium_trajectory, initial_theta = residuals
-    grad_final = grad_obj[0]
-    if grad_final is None:
-        return jax.tree_util.tree_map(lambda _p: None, perturbed)
-
-    max_num_sources = prior_particles.shape[-2]
-    max_source_dim = prior_particles.shape[-1]
-    backward_solver = (
-        cfg.fixed_point_solver
-        if cfg.fixed_point_backward_solver == "same"
-        else cfg.fixed_point_backward_solver
-    )
-
-    if backward_solver == "triangular":
-        grad_model = _deq_triangular_implicit_model_vjp(
-            model,
-            equilibrium_trajectory,
-            initial_theta,
-            observations,
-            observation_count,
-            num_sources,
-            theta_size,
-            max_num_sources,
-            max_source_dim,
-            grad_final,
-        )
-    else:
-        # Generic IFT fallback retained for Picard/Anderson ablations. Unlike the memory-safe
-        # triangular branch this operates on the full augmented state and can be substantially
-        # more expensive for large B,T,N,H.
-        contexts = jax.lax.map(
-            lambda block: model._encode_observation_block(block, num_sources, theta_size),
-            observations,
-        )
-
-        def state_operator(state):
-            return _deq_trajectory_operator(
-                model,
-                state,
-                initial_theta,
-                contexts,
-                observation_count,
-                num_sources,
-                theta_size,
-                max_num_sources,
-                max_source_dim,
-            )
-
-        _, state_pullback = eqx.filter_vjp(state_operator, equilibrium_trajectory)
-        grad_trajectory = jnp.zeros_like(equilibrium_trajectory).at[-1].set(grad_final)
-        regularization = jnp.asarray(
-            cfg.fixed_point_backward_regularization, dtype=equilibrium_trajectory.dtype
-        )
-
-        def linear_fixed_point(u):
-            jt_u = state_pullback(u)[0]
-            return (grad_trajectory + jt_u) / (
-                jnp.asarray(1.0, dtype=equilibrium_trajectory.dtype) + regularization
-            )
-
-        implicit_cotangent, _steps, _residual = _solve_fixed_point(
-            linear_fixed_point,
-            jnp.zeros_like(grad_trajectory),
-            solver=backward_solver,
-            max_steps=cfg.fixed_point_backward_max_steps,
-            tolerance=cfg.fixed_point_backward_tolerance,
-            relaxation=cfg.fixed_point_relaxation,
-            anderson_history=cfg.fixed_point_anderson_history,
-            anderson_ridge=cfg.fixed_point_anderson_ridge,
-        )
-
-        def model_operator(candidate_model):
-            candidate_contexts = jax.lax.map(
-                lambda block: candidate_model._encode_observation_block(
-                    block, num_sources, theta_size
-                ),
-                observations,
-            )
-            return _deq_trajectory_operator(
-                candidate_model,
-                equilibrium_trajectory,
-                initial_theta,
-                candidate_contexts,
-                observation_count,
-                num_sources,
-                theta_size,
-                max_num_sources,
-                max_source_dim,
-            )
-
-        _, model_pullback = eqx.filter_vjp(model_operator, model)
-        grad_model = model_pullback(implicit_cotangent)[0]
-
-    return jax.tree_util.tree_map(
-        lambda grad, is_perturbed: grad if is_perturbed else None,
-        grad_model,
-        perturbed,
-        is_leaf=lambda leaf: leaf is None,
-    )
-
-
-def _deq_batch_objective(
-    model: SequentialBayesModel,
-    batch: dict[str, Array],
-    cfg: BayesTransportConfig,
-) -> tuple[Array, dict[str, Array], Array]:
-    """Energy-score the final cloud after T distinct-observation implicit Bayes updates."""
-    if batch["observations"].ndim != 4:
-        raise ValueError(
-            "deq_fixed_point minibatches must contain observations [B,T,Omax,Dmax+1]."
-        )
-    prefix_counts = jnp.arange(
-        cfg.min_observations_per_step,
-        cfg.max_observations_per_step + 1,
-        dtype=jnp.int32,
-    )
-
-    def row_solve(inputs):
-        prior, observations, sources, size = inputs
-
-        def one_prefix(observation_count):
-            return deq_fixed_point_cloud(
-                model,
-                prior,
-                observations,
-                observation_count,
-                sources,
-                size,
-                cfg=cfg,
-            )
-
-        # Serialising prefixes and rows is intentionally conservative on memory. P is usually
-        # tiny; users who prefer throughput can switch these maps back to vmap locally.
-        return jax.lax.map(one_prefix, prefix_counts)
-
-    predicted, fp_steps, fp_residuals = jax.lax.map(
-        row_solve,
-        (
-            batch["prior_particles"],
-            batch["observations"],
-            batch["num_sources"],
-            batch["theta_size"],
-        ),
-    )                                                           # [B,P,N,Kmax]
-    target_theta = _compact_targets(
-        batch["theta_true"], batch["num_sources"], batch["theta_size"], cfg
-    )
-    energy, attraction, repulsion, rmse, spread = jax.vmap(_prefix_metrics)(
-        predicted, target_theta, batch["theta_size"]
-    )
-    loss = jnp.mean(energy)
-    metrics = {
-        "loss": loss,
-        "energy_score": jnp.mean(energy),
-        "final_energy_score": jnp.mean(energy[:, -1]),
-        "posterior_mean_rmse": jnp.mean(rmse),
-        "final_mean_rmse": jnp.mean(rmse[:, -1]),
-        "posterior_spread": jnp.mean(spread),
-        "final_spread": jnp.mean(spread[:, -1]),
-        "attraction": jnp.mean(attraction),
-        "repulsion": jnp.mean(repulsion),
-        "energy_by_o": jnp.mean(energy, axis=0),
-        "rmse_by_o": jnp.mean(rmse, axis=0),
-        "spread_by_o": jnp.mean(spread, axis=0),
-        "prefix_counts": prefix_counts,
-        "fixed_point_steps": jnp.mean(fp_steps.astype(jnp.float32)),
-        "fixed_point_residual": jnp.mean(fp_residuals),
-        "training_fixed_point_iterations": jnp.asarray(
-            cfg.training_fixed_point_max_iterations, dtype=jnp.float32
-        ),
-    }
-    return loss, metrics, predicted[:, -1]
-
-
-def _masked_pairwise_distance(
-    x: Array,
-    y: Array,
-    theta_size: Array,
-    eps: float,
-) -> Array:
-    valid = (jnp.arange(x.shape[-1]) < theta_size).astype(x.dtype)
-    diff = (x[:, None, :] - y[None, :, :]) * valid[None, None, :]
-    return jnp.sqrt(jnp.sum(jnp.square(diff), axis=-1) + eps)
-
-
-def _kernel_drifting_field_single(
-    x: Array,
-    target_theta: Array,
-    theta_size: Array,
-    temperature: float,
-    eps: float,
-) -> Array:
-    """Deng et al. Algorithm-2 field with one stochastic positive posterior draw."""
-    y_pos = target_theta[None, :]
-    y_neg = x
-    dist_pos = _masked_pairwise_distance(x, y_pos, theta_size, eps)
-    dist_neg = _masked_pairwise_distance(x, y_neg, theta_size, eps)
-    dist_neg = dist_neg + jnp.eye(x.shape[0], dtype=x.dtype) * jnp.asarray(1e6, x.dtype)
-    logit_pos = -dist_pos / jnp.asarray(temperature, dtype=x.dtype)
-    logit_neg = -dist_neg / jnp.asarray(temperature, dtype=x.dtype)
-    logits = jnp.concatenate([logit_pos, logit_neg], axis=1)
-    a_row = jax.nn.softmax(logits, axis=1)
-    a_col = jax.nn.softmax(logits, axis=0)
-    a = jnp.sqrt(jnp.maximum(a_row * a_col, jnp.asarray(0.0, dtype=x.dtype)))
-    a_pos = a[:, :1]
-    a_neg = a[:, 1:]
-    w_pos = a_pos * jnp.sum(a_neg, axis=1, keepdims=True)
-    w_neg = a_neg * jnp.sum(a_pos, axis=1, keepdims=True)
-    drift = w_pos @ y_pos - w_neg @ y_neg
-    valid = (jnp.arange(x.shape[-1]) < theta_size).astype(x.dtype)
-    return drift * valid[None, :]
-
-
-def _energy_score_drifting_field_single(
-    x: Array,
-    target_theta: Array,
-    theta_size: Array,
-    eps: float,
-) -> Array:
-    """Negative energy-score gradient, rescaled by N to keep an O(1) particle drift."""
-    valid = (jnp.arange(x.shape[-1]) < theta_size).astype(x.dtype)
-    to_target = (target_theta[None, :] - x) * valid[None, :]
-    target_norm = jnp.sqrt(jnp.sum(jnp.square(to_target), axis=-1, keepdims=True) + eps)
-    attraction = to_target / target_norm
-    pair_diff = (x[:, None, :] - x[None, :, :]) * valid[None, None, :]
-    pair_norm = jnp.sqrt(jnp.sum(jnp.square(pair_diff), axis=-1, keepdims=True) + eps)
-    repulsion = jnp.mean(pair_diff / pair_norm, axis=1)
-    return (attraction + repulsion) * valid[None, :]
-
-
-def _canonical_drifting_field_name(name: str) -> str:
-    """Map historical drifting-field names onto the explicit current names."""
-    name = str(name)
-    if name == "energy":
-        return "energy_score_gradient"
-    if name == "kernel_energy":
-        return "kernel_energy_score_gradient"
-    return name
-
-
-def _drifting_loss_single(
-    x: Array,
-    target_theta: Array,
-    theta_size: Array,
-    cfg: BayesTransportConfig,
-) -> Array:
-    """Return the configured one-step drifting loss for one empirical cloud.
-
-    ``energy_score`` is intentionally the scalar proper-score objective itself. The remaining
-    choices are genuine vector fields and use the Deng-style frozen regression target
-    ``stopgrad(x + eta * V)``. Keeping the scalar option explicit avoids pretending that a scalar
-    energy score is itself a vector field, while still allowing the requested side-by-side ablation.
-    """
-    field_name = _canonical_drifting_field_name(cfg.drifting_field)
-    if field_name == "energy_score":
-        return energy_score_single(x, target_theta, theta_size)
-
-    valid = (jnp.arange(x.shape[-1]) < theta_size).astype(x.dtype)
-    denom = jnp.maximum(
-        jnp.asarray(x.shape[0], dtype=x.dtype) * theta_size.astype(x.dtype),
-        jnp.asarray(1.0, dtype=x.dtype),
-    )
-    energy_gradient_field = _energy_score_drifting_field_single(
-        x, target_theta, theta_size, cfg.drifting_distance_epsilon
-    )
-
-    if field_name == "energy_score_gradient":
-        target = jax.lax.stop_gradient(x + cfg.drifting_eta * energy_gradient_field)
-        return jnp.sum(jnp.square((x - target) * valid[None, :])) / denom
-
-    total = jnp.asarray(0.0, dtype=x.dtype)
-    for temperature in cfg.drifting_temperatures:
-        drift = _kernel_drifting_field_single(
-            x,
-            target_theta,
-            theta_size,
-            temperature,
-            cfg.drifting_distance_epsilon,
-        )
-        if field_name == "kernel_energy_score_gradient":
-            drift = drift + cfg.drifting_energy_weight * energy_gradient_field
-        target = jax.lax.stop_gradient(x + cfg.drifting_eta * drift)
-        total = total + jnp.sum(jnp.square((x - target) * valid[None, :])) / denom
-    return total
-
-def _drifting_batch_objective(
-    model: SequentialBayesModel,
-    batch: dict[str, Array],
-    cfg: BayesTransportConfig,
-) -> tuple[Array, dict[str, Array], Array]:
-    """One-step drifting-model regression; optimizer time is the only drifting iteration.
-
-    This follows the logic of Deng et al. Algorithm 1: x is produced once by the current network,
-    x itself supplies the negative cloud, x+V(x) is frozen, and the current prediction is regressed
-    toward that target. There is deliberately no recurrent t-loop and no fixed-point solver here.
-    Exposure to the model's own previous errors is handled across optimizer steps by the host-side
-    historical-output prior buffer.
-    """
-    if batch["observations"].ndim != 3:
-        raise ValueError(
-            "drifting minibatches must contain observations [B,Omax,Dmax+1]."
-        )
-    predicted, direct_metrics = _direct_prediction_and_metrics(model, batch, cfg)
-    target_theta = _compact_targets(
-        batch["theta_true"], batch["num_sources"], batch["theta_size"], cfg
-    )
-
-    def row_loss(prefix_clouds, target, size):
-        return jnp.mean(
-            jax.vmap(lambda cloud: _drifting_loss_single(cloud, target, size, cfg))(
-                prefix_clouds
-            )
-        )
-
-    row_losses = jax.vmap(row_loss)(predicted, target_theta, batch["theta_size"])
-    loss = jnp.mean(row_losses)
-    metrics = dict(direct_metrics)
-    metrics["loss"] = loss
-    metrics["drifting_loss"] = loss
-    # Final O-prefix outputs are detached on the host after train_step and may become future priors.
-    return loss, metrics, predicted[:, -1]
-
-
-def batch_objective(
-    model: SequentialBayesModel,
-    batch: dict[str, Array],
-    cfg: BayesTransportConfig = CFG,
-) -> tuple[Array, tuple[dict[str, Array], Array]]:
-    """Training objective dispatch plus final-prefix clouds for historical-output replay."""
-    if cfg.training_mode == "energy_score":
-        predicted, metrics = _direct_prediction_and_metrics(model, batch, cfg)
-        return metrics["loss"], (metrics, predicted[:, -1])
-    if cfg.training_mode == "deq_fixed_point":
-        loss, metrics, replay_clouds = _deq_batch_objective(model, batch, cfg)
-        return loss, (metrics, replay_clouds)
-    if cfg.training_mode == "drifting":
-        loss, metrics, replay_clouds = _drifting_batch_objective(model, batch, cfg)
-        return loss, (metrics, replay_clouds)
-    raise ValueError(f"Unsupported training_mode={cfg.training_mode!r}")
+    return loss, metrics
 
 
 @eqx.filter_jit
@@ -3311,8 +2692,7 @@ def amortized_evaluation_batch(
     batch: dict[str, Array],
     cfg: BayesTransportConfig = CFG,
 ) -> dict[str, Array]:
-    # Evaluation is fixed across training modes: always score the original direct one-step map.
-    _, metrics = _direct_prediction_and_metrics(model, batch, cfg)
+    _, metrics = batch_objective(model, batch, cfg)
     return metrics
 
 
@@ -3362,7 +2742,7 @@ def evaluate_amortized_model(
     batch_size: int | None = None,
     seed: int | None = None,
 ) -> dict[str, np.ndarray | float]:
-    """Evaluate the unchanged direct one-step empirical-energy protocol used for model selection."""
+    """Evaluate the exact non-sequential iid objective used for model selection."""
     n_total = len(dataset["theta_true"])
     if max_samples is not None:
         n_total = min(n_total, int(max_samples))
@@ -3508,7 +2888,7 @@ def plot_architecture_schematic(
     cfg: BayesTransportConfig = CFG,
     destination: Path | None = None,
 ):
-    """Visual map separating the configurable training objective from unchanged evaluation."""
+    """Visual map separating iid empirical-energy training from sequential evaluation."""
     fig, ax = plt.subplots(1, 1, figsize=(16.2, 7.0), constrained_layout=True)
 
     def draw_box(xy, width, height, text, title=None):
@@ -3533,17 +2913,13 @@ def plot_architecture_schematic(
                     text, ha="center", va="bottom", fontsize=7.7)
 
     ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis("off")
-    ax.text(0.01, 0.96, f"TRAINING: {cfg.training_mode}",
+    ax.text(0.01, 0.96, "TRAINING: iid joint samples, no posterior recurrence",
             fontsize=12, fontweight="bold", va="top")
     ax.text(0.01, 0.43, "EVALUATION ONLY: repeatedly apply the same learned Bayes transport",
             fontsize=12, fontweight="bold", va="top")
 
-    train_obs_text = (
-        f"one theta* ~ rho_0\nT={cfg.training_fixed_point_max_iterations} fresh blocks from theta*"
-        if cfg.training_mode == "deq_fixed_point"
-        else "actual theta* ~ rho_0\nOmax observations from theta*"
-    )
-    draw_box((0.02, 0.65), 0.14, 0.20, train_obs_text, "training simulator row")
+    draw_box((0.02, 0.65), 0.14, 0.20,
+             "actual theta* ~ rho_0\nOmax observations from theta*", "iid simulator row")
     fixed_shape = (
         cfg.min_num_sources == cfg.max_num_sources
         and cfg.min_source_dim == cfg.max_source_dim
@@ -3553,17 +2929,16 @@ def plot_architecture_schematic(
         and cfg.max_observations_per_step == 1
     )
     if fixed_shape:
-        fixed_input = (
-            f"linear projection -> E={cfg.embedding_dim}"
-            if cfg.fixed_shape_learned_projection
-            else f"parameter-free width D+1={cfg.max_source_dim + 1}"
-        )
         if single_observation_direct:
             context_label = (
-                f"{fixed_input}\nLikelihood Transformer bypass: 0 params\n1 token -> Posterior"
+                f"parameter-free (x,y) normalization\nLikelihood Transformer bypass: 0 params\n"
+                f"1 x (D+1)={cfg.max_source_dim + 1} -> Posterior"
             )
         else:
-            context_label = f"{fixed_input}\ncausal Transformer\nOmax tokens"
+            context_label = (
+                f"parameter-free (x,y) normalization\ncausal Transformer\n"
+                f"Omax x (D+1)={cfg.max_source_dim + 1}"
+            )
     else:
         if single_observation_direct:
             context_label = (
@@ -3573,37 +2948,27 @@ def plot_architecture_schematic(
         else:
             context_label = f"dimension embedder\ncausal Transformer\nOmax x E={cfg.embedding_dim}"
     draw_box((0.20, 0.64), 0.17, 0.22, context_label, "Y -> contexts")
+    truth_mode_label = cfg.synthetic_truth_sampling_mode
+    if truth_mode_label == "bernoulli_choice":
+        truth_mode_label += f" (p_match={cfg.synthetic_prior_match_probability:.2f})"
     draw_box(
         (0.02, 0.47), 0.14, 0.14,
-        f"theta* ~ rho_0\nanchor=theta* w.p. {cfg.synthetic_prior_match_probability:.2f}\n"
-        "shared tau ~ U[0,1]\nC_tau=(1-tau)z+tau anchor",
+        f"z_n, theta_tilde ~ rho_0\ntau ~ U[0,1]\n"
+        f"C_tau=(1-tau)z+tau theta_tilde\ntheta*: {truth_mode_label}",
         "synthetic input cloud",
     )
     draw_box((0.42, 0.58), 0.22, 0.27,
              f"particle self-attention\n{cfg.posterior_conditioning} conditioning\nphysical displacement head",
              "Posterior Transformer")
-    if cfg.training_mode == "deq_fixed_point":
-        recurrent_training_text = (
-            f"T={cfg.training_fixed_point_max_iterations}: C_t + fresh Y_t -> C_(t+1)\n"
-        )
-    elif cfg.training_mode == "drifting":
-        recurrent_training_text = "one T_phi call; optimizer step supplies drifting time\n"
-    else:
-        recurrent_training_text = "one T_phi call per prefix\n"
     draw_box((0.71, 0.60), 0.25, 0.23,
              f"vmap over o={cfg.min_observations_per_step},...,{cfg.max_observations_per_step}\n"
-             f"{recurrent_training_text}training objective: {cfg.training_mode}",
-             "training clouds")
+             "each prefix starts from same cloud C_tau\nempirical energy-score objective",
+             "direct posterior clouds")
 
     arrow((0.16, 0.75), (0.20, 0.75))
     arrow((0.37, 0.75), (0.42, 0.73), "all causal prefix signals")
-    replay_label = (
-        f"C_tau or replay prior (p={cfg.historical_output_prior_probability:.2f})"
-        if cfg.training_mode in {"energy_score", "drifting"}
-        else "C_tau starts each DEQ rollout"
-    )
-    arrow((0.16, 0.54), (0.42, 0.65), replay_label)
-    arrow((0.64, 0.71), (0.71, 0.71), "shared Bayes-update cell")
+    arrow((0.16, 0.54), (0.42, 0.65), "same C_tau for every o")
+    arrow((0.64, 0.71), (0.71, 0.71), "T_phi(C_tau; Y_1:o)")
 
     draw_box((0.02, 0.11), 0.16, 0.19,
              "one theta* fixed\nnew observation block each t", "trajectory")
@@ -4139,7 +3504,7 @@ def plot_training_diagnostics(
 
     values = np.maximum(np.asarray(history["step_loss"], dtype=float), 1e-12)
     raw_loss_line = axes[0, 0].plot(
-        steps, values, linewidth=0.70, alpha=0.28, label=f"training loss ({cfg.training_mode})"
+        steps, values, linewidth=0.70, alpha=0.28, label="empirical cloud energy score"
     )[0]
     if len(values) >= 20:
         window = max(5, len(values) // 100)
@@ -4179,22 +3544,10 @@ def plot_training_diagnostics(
     axes[0, 2].grid(alpha=0.2)
     axes[0, 2].legend(fontsize=8)
 
-    axes[0, 3].plot(steps, history["step_grad_norm"], linewidth=0.75, label="gradient norm")
-    axes[0, 3].set_title("Gradient / equilibrium diagnostics", loc="left", fontweight="bold")
+    axes[0, 3].plot(steps, history["step_grad_norm"], linewidth=0.75)
+    axes[0, 3].set_title("Gradient norm", loc="left", fontweight="bold")
     axes[0, 3].set_xlabel("train step")
     axes[0, 3].grid(alpha=0.2)
-    fp_residual = np.asarray(
-        history.get("step_fixed_point_residual", np.full(len(steps), np.nan)), dtype=float
-    )
-    if fp_residual.shape == steps.shape and np.any(np.isfinite(fp_residual)):
-        fp_axis = axes[0, 3].twinx()
-        fp_axis.plot(
-            steps, np.maximum(fp_residual, 1e-12), linewidth=0.75, linestyle=":",
-            label="DEQ fixed-point residual",
-        )
-        fp_axis.set_yscale("log")
-        fp_axis.set_ylabel("fixed-point residual")
-    axes[0, 3].legend(fontsize=8, loc="upper left")
 
     train_step_formatter = FuncFormatter(_format_train_step_k)
     for ax in axes[0, :]:
@@ -4202,11 +3555,11 @@ def plot_training_diagnostics(
 
     axes[1, 0].plot(
         epochs, np.maximum(history["epoch_train_loss"], 1e-12), marker="o", markersize=3,
-        label=f"train loss ({cfg.training_mode})"
+        label="train energy score"
     )
     axes[1, 0].plot(
         epochs, np.maximum(history["epoch_val_loss"], 1e-12), marker="o", markersize=3,
-        label="iid validation energy score (model selection)"
+        label="iid validation energy score"
     )
     axes[1, 0].axvline(best_epoch, linestyle="--", linewidth=1.0, label=f"best epoch {best_epoch}")
     if "epoch_learning_rate" in history:
@@ -4266,8 +3619,7 @@ def plot_training_diagnostics(
         ax.legend(fontsize=8)
 
     fig.suptitle(
-        f"Bayes transport training={cfg.training_mode} + unchanged sequential evaluation "
-        f"({cfg.posterior_conditioning})",
+        f"Single-cloud energy-score training + sequential evaluation ({cfg.posterior_conditioning})",
         fontsize=14,
         fontweight="bold",
     )
@@ -4287,23 +3639,23 @@ def train_model(
     run_dir: Path,
     cfg: BayesTransportConfig = CFG,
 ) -> dict[str, Any]:
-    """Train the configured objective while keeping the evaluation protocol unchanged.
+    """Train the direct amortized map; keep recurrence strictly out of the gradient path.
 
-    ``energy_score`` differentiates the original direct map. ``deq_fixed_point`` solves an
-    augmented recurrent-trajectory equilibrium and uses a custom implicit VJP. ``drifting`` is a
-    single network call with frozen drift-target regression; its temporal evolution is optimizer
-    time, not an inner t-loop. Energy-score and drifting training can replace C_tau by detached
-    historical model outputs sampled from a bounded replay buffer, with fresh observations drawn
-    from the associated stored theta*. Every mode still uses all within-step observation prefixes.
+    Every training row contains one independently generated joint triple (C_tau,theta*,Y),
+    with theta* sampled from C_tau's closed-form population law, its empirical measure, or
+    the retained legacy Bernoulli rule according to the configured truth mode.  One causal
+    observation pass yields Omax contextual tokens, then
+    the same Posterior Transformer is vmapped over all prefix counts Omin,...,Omax.  Every
+    prefix starts from the same C_tau.  The optimized loss is the exact empirical multivariate
+    energy score of that transported cloud, averaged over batch rows and prefixes.
 
-    Validation/model selection always evaluates the original direct empirical energy score, and
-    the separate sequential dataset always evaluates repeated application of the learned map.
+    A separate fixed sequential dataset is evaluated after every epoch.  Those recurrent
+    rollouts use the same learned parameters but are diagnostics only and are never
+    differentiated.  This directly tests whether repeated application with one fixed theta*
+    sharpens the particle cloud as more independent observation blocks arrive.
     """
     model = SequentialBayesModel(cfg, key=jax.random.key(cfg.seed))
-    print(
-        f"\namortized Bayes transport: training={cfg.training_mode}, "
-        f"conditioning={cfg.posterior_conditioning}"
-    )
+    print(f"\namortized single-cloud energy transport ({cfg.posterior_conditioning})")
     print_model_parameter_count(model)
     optimizer = optax.chain(
         optax.clip_by_global_norm(cfg.grad_clip_norm),
@@ -4321,16 +3673,9 @@ def train_model(
     )
     plateau_state = plateau.init(params)
 
-    replay_enabled = (
-        cfg.training_mode in {"energy_score", "drifting"}
-        and cfg.historical_output_prior_probability > 0.0
-    )
-    replay_buffer = HistoricalOutputPriorBuffer(cfg.historical_output_buffer_capacity)
-    replay_rng = np.random.default_rng(cfg.seed + 73_001)
-
     @eqx.filter_jit
     def train_step(candidate_model, candidate_opt_state, learning_rate_scale, batch):
-        (loss, (metrics, replay_clouds)), grads = eqx.filter_value_and_grad(
+        (loss, metrics), grads = eqx.filter_value_and_grad(
             batch_objective, has_aux=True
         )(candidate_model, batch, cfg)
         params = eqx.filter(candidate_model, eqx.is_array)
@@ -4340,7 +3685,7 @@ def train_model(
         updates = jax.tree_util.tree_map(lambda update: learning_rate_scale * update, updates)
         candidate_model = eqx.apply_updates(candidate_model, updates)
         grad_norm = optax.global_norm(eqx.filter(grads, eqx.is_array))
-        return candidate_model, candidate_opt_state, loss, metrics, grad_norm, replay_clouds
+        return candidate_model, candidate_opt_state, loss, metrics, grad_norm
 
     history: dict[str, list] = {
         "step_loss": [],
@@ -4350,10 +3695,6 @@ def train_model(
         "step_attraction": [],
         "step_repulsion": [],
         "step_grad_norm": [],
-        "step_fixed_point_steps": [],
-        "step_fixed_point_residual": [],
-        "step_historical_prior_fraction": [],
-        "step_historical_buffer_size": [],
         "epoch_train_loss": [],
         "epoch_learning_rate": [],
         "epoch_val_loss": [],
@@ -4422,24 +3763,13 @@ def train_model(
         )
 
         for _ in progress:
-            # Fresh simulator rows always begin from C_tau. For energy_score/drifting, a configured
-            # fraction can instead be replaced by detached historical model outputs. A replayed row
-            # carries the theta* and EXACT observation block used when that output was first/currently
-            # produced; only the prior cloud changes. DEQ never uses this host-side replay path.
+            # Every next() call yields fresh iid simulator rows and fresh synthetic interpolated
+            # input clouds. No observation count is sampled: batch_objective uses ALL prefixes.
             batch_np = next(train_iterator)
-            replayed_rows = 0
-            if replay_enabled:
-                batch_np, replayed_rows = replay_buffer.mix_into_batch(
-                    batch_np, replay_rng, cfg
-                )
             batch = {name: jnp.asarray(value) for name, value in batch_np.items()}
-            model, opt_state, loss, metrics, grad_norm, replay_clouds = train_step(
+            model, opt_state, loss, metrics, grad_norm = train_step(
                 model, opt_state, epoch_lr_scale, batch
             )
-            if replay_enabled:
-                replay_buffer.add_batch(
-                    np.asarray(jax.device_get(replay_clouds)), batch_np, cfg
-                )
             host = jax.device_get(metrics)
             host_loss = float(jax.device_get(loss))
             host_grad_norm = float(jax.device_get(grad_norm))
@@ -4453,24 +3783,11 @@ def train_model(
             history["step_attraction"].append(float(host["attraction"]))
             history["step_repulsion"].append(float(host["repulsion"]))
             history["step_grad_norm"].append(host_grad_norm)
-            history["step_fixed_point_steps"].append(
-                float(host.get("fixed_point_steps", np.nan))
+            progress.set_postfix(
+                ES=f"{host_loss:.4f}",
+                RMSE=f"{float(host['posterior_mean_rmse']):.4f}",
+                refresh=False,
             )
-            history["step_fixed_point_residual"].append(
-                float(host.get("fixed_point_residual", np.nan))
-            )
-            replay_fraction = replayed_rows / max(int(cfg.batch_size), 1)
-            history["step_historical_prior_fraction"].append(float(replay_fraction))
-            history["step_historical_buffer_size"].append(float(len(replay_buffer)))
-            postfix = {
-                "loss": f"{host_loss:.4f}",
-                "RMSE": f"{float(host['posterior_mean_rmse']):.4f}",
-            }
-            if "fixed_point_residual" in host:
-                postfix["fpR"] = f"{float(host['fixed_point_residual']):.2e}"
-            if replay_enabled:
-                postfix["replay"] = f"{replayed_rows}/{cfg.batch_size}"
-            progress.set_postfix(**postfix, refresh=False)
 
         epoch_train_loss = float(np.mean(train_losses_this_epoch))
         val_metrics = evaluate_amortized_model(
@@ -4530,28 +3847,16 @@ def train_model(
             run_dir / "artefacts" / "training_state.json",
             {
                 "training": (
-                    "continuous simulator rows; DEQ uses one theta* with "
-                    f"{cfg.training_fixed_point_max_iterations} fresh observation blocks; "
-                    "energy_score/drifting are one-step and may replay historical outputs; "
-                    f"training_mode={cfg.training_mode}"
+                    "iid dataloader-generated (C_tau,theta*,Y) triples; "
+                    "direct transports for all observation prefixes"
                 ),
                 "data_assumption": (
-                    "theta* ~ base prior; one shared tau ~ Uniform[0,1]; interpolation anchor "
-                    "matches theta* with configured probability, otherwise it is independent"
+                    "training rows are iid from the configured synthetic-prior joint generator; "
+                    "Y is always simulated conditionally on the theta* selected by the configured truth mode"
                 ),
                 "conditioning": cfg.posterior_conditioning,
-                "posterior_recurrence_in_training": (cfg.training_mode == "deq_fixed_point"),
-                "training_fixed_point_max_iterations": cfg.training_fixed_point_max_iterations,
-                "fresh_observation_block_each_training_iteration": (
-                    cfg.training_mode == "deq_fixed_point"
-                ),
-                "historical_output_prior_probability": cfg.historical_output_prior_probability,
-                "historical_output_buffer_capacity": cfg.historical_output_buffer_capacity,
-                "historical_output_buffer_size": len(replay_buffer),
-                "sequential_recurrence": (
-                    "DEQ training and evaluation reuse the same learned Bayes-update cell; drifting "
-                    "has no inner recurrence; evaluation protocol itself is unchanged"
-                ),
+                "posterior_recurrence_in_training": False,
+                "sequential_recurrence": "evaluation only; repeated same learned transport with jax.lax.scan",
                 "epoch": epoch,
                 "global_step": global_step,
                 "best_epoch": best_epoch,
@@ -4561,18 +3866,17 @@ def train_model(
                 "lr_plateau_patience": cfg.lr_plateau_patience,
                 "lr_plateau_rtol": cfg.lr_plateau_rtol,
                 "elapsed_seconds": time.time() - training_started_at,
-                "objective": cfg.training_mode,
-                "evaluation_objective": "unchanged direct empirical multivariate energy score",
+                "objective": (
+                    "exact empirical multivariate energy score of one transported cloud, "
+                    "averaged over B x all Omin:Omax prefixes"
+                ),
                 "synthetic_input_cloud_independent_of_joint_target": False,
                 "synthetic_input_clouds_per_joint_draw": 1,
                 "base_prior_distribution": cfg.base_prior_distribution,
-                "interpolation_tau_distribution": "one shared tau ~ Uniform[0,1]",
-                "synthetic_prior_match_probability": cfg.synthetic_prior_match_probability,
-                "fixed_point_solver": cfg.fixed_point_solver,
-                "fixed_point_backward_solver": cfg.fixed_point_backward_solver,
-                "drifting_field": cfg.drifting_field,
-                "drifting_eta": cfg.drifting_eta,
-                "historical_replay_observation_policy": "reuse exact stored observation block",
+                "interpolation_tau_mode": cfg.interpolation_tau_mode,
+                "interpolation_tau_distribution": _interpolation_tau_description(cfg),
+                "synthetic_truth_sampling_mode": cfg.synthetic_truth_sampling_mode,
+                "synthetic_prior_match_probability_legacy_only": cfg.synthetic_prior_match_probability,
                 "particle_pair_term": "all within-cloud pairs with empirical N^2 normalization",
                 "min_observations_per_step": cfg.min_observations_per_step,
                 "max_observations_per_step": cfg.max_observations_per_step,
@@ -4581,7 +3885,7 @@ def train_model(
         )
 
         print(
-            f"[amortized] epoch {epoch:03d}: train loss={epoch_train_loss:.6f} | "
+            f"[amortized] epoch {epoch:03d}: train ES={epoch_train_loss:.6f} | "
             f"val ES={float(val_metrics['energy_score']):.6f} | "
             f"val RMSE={float(val_metrics['posterior_mean_rmse']):.5f} | "
             f"lr={epoch_learning_rate:.3e} -> {next_learning_rate:.3e} || "
@@ -4655,7 +3959,7 @@ def _recover_epoch_history_from_nohup(path: Path | None) -> dict[str, np.ndarray
         return None
 
     pattern = re.compile(
-        r"^\[amortized\] epoch\s+(\d+): train (?:ES|loss)=([^|\s]+) \| "
+        r"^\[amortized\] epoch\s+(\d+): train ES=([^|\s]+) \| "
         r"val ES=([^|\s]+) \| val RMSE=([^|\s]+) \| "
         r"lr=([^|\s]+) -> ([^|\s]+) \|\| "
         r"seq final ES=([^|\s]+) \| seq final RMSE=([^|\s]+) \| "
@@ -4752,7 +4056,7 @@ def plot_recovered_nohup_training_diagnostics(
     fig, axes = plt.subplots(2, 3, figsize=(17.2, 9.2), constrained_layout=True)
 
     train_raw = axes[0, 0].plot(
-        epochs, np.maximum(train_es, 1e-12), linewidth=0.65, alpha=0.22, label=f"train loss ({cfg.training_mode})"
+        epochs, np.maximum(train_es, 1e-12), linewidth=0.65, alpha=0.22, label="train ES"
     )[0]
     val_raw = axes[0, 0].plot(
         epochs, np.maximum(val_es, 1e-12), linewidth=0.65, alpha=0.22, label="iid val ES"
@@ -4763,7 +4067,7 @@ def plot_recovered_nohup_training_diagnostics(
         linewidth=2.15,
         alpha=0.96,
         color=train_raw.get_color(),
-        label=f"train loss ({smoothing_window}-epoch mean)",
+        label=f"train ES ({smoothing_window}-epoch mean)",
     )
     axes[0, 0].plot(
         smooth_epochs,
@@ -4778,8 +4082,8 @@ def plot_recovered_nohup_training_diagnostics(
             [0], [max(initial_metrics["initial_iid_energy_score"], 1e-12)],
             marker="x", s=55, label="pre-training iid ES",
         )
-    axes[0, 0].set_title("Training loss and IID validation ES", loc="left", fontweight="bold")
-    axes[0, 0].set_ylabel("objective / energy score")
+    axes[0, 0].set_title("Energy score through training", loc="left", fontweight="bold")
+    axes[0, 0].set_ylabel("energy score")
     axes[0, 0].set_yscale("log")
 
     rmse_raw = axes[0, 1].plot(
@@ -4894,8 +4198,7 @@ def plot_recovered_nohup_training_diagnostics(
 
     fig.suptitle(
         "Recovered interrupted-run training diagnostics from nohup log\n"
-        f"Bayes transport training={cfg.training_mode} + unchanged sequential evaluation "
-        f"({cfg.posterior_conditioning})",
+        f"Single-cloud energy-score training + sequential evaluation ({cfg.posterior_conditioning})",
         fontsize=14,
         fontweight="bold",
     )
@@ -4998,25 +4301,12 @@ if train_wm:
     print(f"  held-out training shapes: {HELDOUT_SHAPES}")
     print(f"  training shapes: {len(TRAIN_SHAPES)} / {len(ALL_SHAPES)} combinations")
     print(f"  base prior rho_0: {prior_mode}")
-    print("  synthetic prior interpolation: one shared tau ~ Uniform[0,1]")
-    print(f"  P(interpolation anchor = theta*): {CFG.synthetic_prior_match_probability:.3f}")
-    print(f"  training mode: {CFG.training_mode}")
-    if CFG.training_mode == "deq_fixed_point":
-        print(
-            f"  DEQ solver: forward={CFG.fixed_point_solver}, "
-            f"backward={CFG.fixed_point_backward_solver}"
-        )
-    if CFG.training_mode == "drifting":
-        print(
-            f"  drifting field: {CFG.drifting_field}; eta={CFG.drifting_eta:g}; "
-            f"temperatures={CFG.drifting_temperatures}"
-        )
-    if CFG.training_mode in {"energy_score", "drifting"}:
-        print(
-            "  historical-output prior replay: "
-            f"p={CFG.historical_output_prior_probability:.3f}, "
-            f"capacity={CFG.historical_output_buffer_capacity}"
-        )
+    print(f"  synthetic prior interpolation: {_interpolation_tau_description(CFG)}")
+    print(f"  theta* sampling from C_tau: {CFG.synthetic_truth_sampling_mode}")
+    print(
+        "  legacy P(theta*=theta_tilde): "
+        f"{CFG.synthetic_prior_match_probability:.3f} (used only in bernoulli_choice mode)"
+    )
     print(f"  training prefixes: {list(range(CFG.min_observations_per_step, CFG.max_observations_per_step + 1))}")
     print(f"  posterior conditioning: {CFG.posterior_conditioning}")
     if CFG.min_observations_per_step == 1 and CFG.max_observations_per_step == 1:
@@ -5365,10 +4655,7 @@ else:
 
 model = result["model"]
 if not train_wm:
-    print(
-        f"\namortized Bayes transport: training={CFG.training_mode}, "
-        f"conditioning={CFG.posterior_conditioning}"
-    )
+    print(f"\namortized single-cloud energy transport ({CFG.posterior_conditioning})")
     print_model_parameter_count(model)
 
 
@@ -6317,23 +5604,17 @@ else:
 
 summary = {
 
-    "objective": CFG.training_mode,
-    "evaluation_objective": "unchanged direct empirical multivariate energy score in physical theta space",
-    "training_mode": CFG.training_mode,
+    "objective": "exact empirical multivariate energy score in physical theta space",
+    "training_mode": "non-sequential amortized transport from synthetic interpolated input clouds",
     "data_assumption": (
-        "energy_score/drifting use one-step (prior,theta*,Y) rows, where prior is C_tau or a "
-        "historical model output; DEQ uses one C_tau and theta* with a T-step sequence of fresh "
-        "conditionally independent observation blocks from theta*"
+        "iid dataloader-generated (C_tau,theta*,Y) rows; observations Y are simulated from the "
+        "theta* selected by synthetic_truth_sampling_mode"
     ),
     "training_data": "infinite PyTorch IterableDataset/DataLoader with NumPy-only simulator randomness",
     "fresh_joint_samples_per_nominal_epoch": CFG.n_train_trajectories,
     "training_prefixes": list(range(CFG.min_observations_per_step, CFG.max_observations_per_step + 1)),
     "all_prefixes_used_each_training_batch": True,
-    "posterior_recurrence_in_training": (CFG.training_mode == "deq_fixed_point"),
-    "training_fixed_point_max_iterations": CFG.training_fixed_point_max_iterations,
-    "fresh_observation_block_each_training_iteration": (CFG.training_mode == "deq_fixed_point"),
-    "historical_output_prior_probability": CFG.historical_output_prior_probability,
-    "historical_output_buffer_capacity": CFG.historical_output_buffer_capacity,
+    "posterior_recurrence_in_training": False,
     "sequential_evaluation": True,
     "sequential_evaluation_recurrence": "jax.lax.scan repeatedly applies the same learned transport",
     "posterior_conditioning": CFG.posterior_conditioning,
@@ -6349,25 +5630,21 @@ summary = {
     "base_prior_distribution": CFG.base_prior_distribution,
     "base_prior_uniform_bounds": [CFG.design_low, CFG.design_high],
     "base_prior_gaussian_std": CFG.prior_std,
-    "synthetic_prior_interpolation": "C_n=(1-tau)Z_n+tau*anchor with one shared tau~Uniform[0,1]",
-    "synthetic_prior_match_probability": CFG.synthetic_prior_match_probability,
-    "fixed_point_solver": CFG.fixed_point_solver,
-    "fixed_point_backward_solver": CFG.fixed_point_backward_solver,
-    "fixed_point_max_steps": CFG.fixed_point_max_steps,
-    "fixed_point_backward_max_steps": CFG.fixed_point_backward_max_steps,
-    "drifting_field": CFG.drifting_field,
-    "drifting_eta": CFG.drifting_eta,
-    "drifting_temperatures": list(CFG.drifting_temperatures),
-    "historical_replay_observation_policy": "reuse exact stored observation block",
+    "synthetic_prior_interpolation": "C_n=(1-tau_n)Z_n+tau_n*theta_tilde",
+    "interpolation_tau_mode": CFG.interpolation_tau_mode,
+    "interpolation_tau_distribution": _interpolation_tau_description(CFG),
+    "interpolation_tau_concentration": CFG.interpolation_tau_concentration,
+    "interpolation_tau_mean_range": [CFG.interpolation_tau_mean_low, CFG.interpolation_tau_mean_high],
+    "synthetic_truth_sampling_mode": CFG.synthetic_truth_sampling_mode,
+    "synthetic_prior_match_probability_legacy_only": CFG.synthetic_prior_match_probability,
     "sequential_initial_prior": "fresh iid base-prior cloud (tau=0)",
     "particle_cloud_transport": "permutation-equivariant cloud-valued map with particle self-attention",
     "spread_term": "all within-cloud empirical pairs with N^2 normalization",
     "dimension_agnostic": not FIXED_SINGLE_SHAPE_SETUP,
-    "fixed_shape_bypass_dimension_aggregators": FIXED_SINGLE_SHAPE_SETUP,
-    "fixed_shape_learned_projection": (CFG.fixed_shape_learned_projection if FIXED_SINGLE_SHAPE_SETUP else None),
+    "fixed_shape_bypass_dimension_embedders": FIXED_SINGLE_SHAPE_SETUP,
     "train_num_sources_range": [CFG.min_num_sources, CFG.max_num_sources],
     "train_source_dim_range": [CFG.min_source_dim, CFG.max_source_dim],
-    "embedding_dim": CFG.embedding_dim,
+    "embedding_dim": (None if FIXED_SINGLE_SHAPE_SETUP else CFG.embedding_dim),
     "fixed_shape_particle_input_dim": (model.particle_input_dim if FIXED_SINGLE_SHAPE_SETUP else None),
     "fixed_shape_observation_input_dim": (
         model.observation_input_dim if FIXED_SINGLE_SHAPE_SETUP else None
