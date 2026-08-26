@@ -122,7 +122,7 @@ class BayesTransportConfig:
     background: float = 0.10
     source_strength: float = 1.0
     softening: float = 0.10
-    observation_noise_std: float = 0.30
+    observation_noise_std: float = 0.10
 
     # Heterogeneous training-task distribution.  Arrays are padded to these maxima,
     # while masks ensure that inactive source/coordinate slots never enter an embedder.
@@ -141,7 +141,7 @@ class BayesTransportConfig:
     # learnable linear projection can optionally map both theta and (design,outcome) inputs into
     # the same E-dimensional interface used by heterogeneous runs.
     embedding_dim: int = 192
-    fixed_shape_learned_projection: bool = True
+    fixed_shape_learned_projection: bool = False
     dimension_embedder_depth: int = 4
     scalar_encoder_depth: int = 4
     embedding_heads: int = 8
@@ -151,12 +151,12 @@ class BayesTransportConfig:
     # batch-level observation count.  test_observations_per_step and evaluation_trajectory_length
     # are used ONLY by evaluation-time recurrent Bayes diagnostics and physical visualisations.
     min_observations_per_step: int = 1
-    max_observations_per_step: int = 1
-    test_observations_per_step: int = 1
-    num_particles: int = 64
-    n_train_trajectories: int = 4096
+    max_observations_per_step: int = 16
+    test_observations_per_step: int = 16
+    num_particles: int = 12
+    n_train_trajectories: int = 4096*2
     n_eval_trajectories: int = 256
-    batch_size: int = 16*2
+    batch_size: int = 16*16
 
     # Single sequential-evaluation horizon used by evaluation diagnostics. In reload mode this
     # field is intentionally taken from the CURRENT script configuration, so a saved model can be
@@ -195,7 +195,7 @@ class BayesTransportConfig:
     mlp_ratio: int = 4
     posterior_depth: int = 6
     max_embedding_displacement: float = 6.0  # retained value; now caps physical theta displacement
-    canonicalize_particle_sources: bool = True
+    canonicalize_particle_sources: bool = False
 
     # Observation normalisation.
     y_center: float = 0.0
@@ -250,7 +250,7 @@ class BayesTransportConfig:
     # Optimisation. The scalar differentiated loss is selected above. The direct empirical
     # energy score is still reported for every mode and remains the validation/model-selection
     # metric, preserving the original evaluation protocol.
-    epochs: int = 10000
+    epochs: int = 5000
     learning_rate: float = 1e-5
     weight_decay: float = 1e-4
     grad_clip_norm: float = 1000.0
@@ -571,10 +571,14 @@ def sample_base_prior_np(
         raise ValueError("Requested base-prior shape exceeds configured padded limits.")
     shape = (int(n), S, D)
     if cfg.base_prior_distribution == "uniform":
-        return rng.uniform(cfg.design_low, cfg.design_high, size=shape).astype(np.float32)
-    if cfg.base_prior_distribution == "gaussian":
-        return rng.normal(0.0, cfg.prior_std, size=shape).astype(np.float32)
-    raise ValueError("base_prior_distribution must be 'uniform' or 'gaussian'.")
+        samples = rng.uniform(cfg.design_low, cfg.design_high, size=shape).astype(np.float32)
+    elif cfg.base_prior_distribution == "gaussian":
+        samples = rng.normal(0.0, cfg.prior_std, size=shape).astype(np.float32)
+    else:
+        raise ValueError("base_prior_distribution must be 'uniform' or 'gaussian'.")
+    if cfg.canonicalize_particle_sources:
+        samples = canonicalize_sources_np(samples)
+    return samples
 
 
 def sample_interpolated_training_prior_and_truth_np(
@@ -619,6 +623,8 @@ def sample_interpolated_training_prior_and_truth_np(
     prior_particles = (
         (np.float32(1.0) - tau) * base_particles + tau * anchor[None, :, :]
     ).astype(np.float32)
+    if cfg.canonicalize_particle_sources:
+        prior_particles = canonicalize_sources_np(prior_particles)
     return prior_particles, np.asarray(theta_true, dtype=np.float32)
 
 
@@ -635,6 +641,8 @@ def sample_interpolated_prior_given_truth_np(
     S = int(num_sources)
     D = int(source_dim)
     theta_true = np.asarray(theta_true, dtype=np.float32)[:S, :D]
+    if cfg.canonicalize_particle_sources:
+        theta_true = canonicalize_sources_np(theta_true)
     if rng.random() < cfg.synthetic_prior_match_probability:
         anchor = theta_true
     else:
@@ -645,9 +653,12 @@ def sample_interpolated_prior_given_truth_np(
         rng, int(n_particles), cfg, num_sources=S, source_dim=D
     )
     tau = np.float32(rng.uniform(0.0, 1.0))
-    return (
+    prior_particles = (
         (np.float32(1.0) - tau) * base_particles + tau * anchor[None, :, :]
     ).astype(np.float32)
+    if cfg.canonicalize_particle_sources:
+        prior_particles = canonicalize_sources_np(prior_particles)
+    return prior_particles
 
 def _base_prior_plot_extent(cfg: BayesTransportConfig = CFG) -> float:
     """Natural one-coordinate plotting extent for the configured t=0 prior."""
@@ -810,11 +821,13 @@ def simulate_trajectories(
         theta_active = sample_base_prior_np(
             rng, 1, cfg, num_sources=S, source_dim=D
         )[0]
-        designs = rng.uniform(
-            cfg.design_low,
-            cfg.design_high,
-            size=(trajectory_length, cfg.max_observations_per_step, D),
-        ).astype(np.float32)
+        designs = canonicalize_designs_np(
+            rng.uniform(
+                cfg.design_low,
+                cfg.design_high,
+                size=(trajectory_length, cfg.max_observations_per_step, D),
+            ).astype(np.float32)
+        )
         mean = source_log_mean_np(theta_active, designs, cfg)
         readings = (
             mean + cfg.observation_noise_std * rng.normal(size=mean.shape)
@@ -890,11 +903,13 @@ def simulate_iid_joint_samples(
             num_sources=S,
             source_dim=D,
         )
-        designs = rng.uniform(
-            cfg.design_low,
-            cfg.design_high,
-            size=(cfg.max_observations_per_step, D),
-        ).astype(np.float32)
+        designs = canonicalize_designs_np(
+            rng.uniform(
+                cfg.design_low,
+                cfg.design_high,
+                size=(cfg.max_observations_per_step, D),
+            ).astype(np.float32)
+        )
         mean = source_log_mean_np(theta_active, designs, cfg)
         readings = (
             mean + cfg.observation_noise_std * rng.normal(size=mean.shape)
@@ -1169,11 +1184,13 @@ class ContinuousJointDataset(IterableDataset):
                 source_dim=D,
             )
 
-            designs = rng.uniform(
-                self.cfg.design_low,
-                self.cfg.design_high,
-                size=(training_steps, self.cfg.max_observations_per_step, D),
-            ).astype(np.float32)
+            designs = canonicalize_designs_np(
+                rng.uniform(
+                    self.cfg.design_low,
+                    self.cfg.design_high,
+                    size=(training_steps, self.cfg.max_observations_per_step, D),
+                ).astype(np.float32)
+            )
             mean = source_log_mean_np(theta_active, designs, self.cfg)
             readings = (
                 mean + self.cfg.observation_noise_std * rng.normal(size=mean.shape)
@@ -1334,31 +1351,67 @@ def make_continuous_train_loader(
 
 #%% 4) Source-label symmetry helpers
 def canonicalize_sources_np(theta: np.ndarray) -> np.ndarray:
-    """Sort ACTIVE exchangeable sources by their first coordinate."""
+    """Sort ACTIVE exchangeable sources by increasing Euclidean norm to the origin."""
     theta = np.asarray(theta)
-    order = np.argsort(theta[..., 0], axis=-1)
+    key = np.linalg.norm(theta, axis=-1)
+    order = np.argsort(key, axis=-1, kind="stable")
     return np.take_along_axis(theta, order[..., None], axis=-2)
 
 
 def canonicalize_sources_jax(theta: Array) -> Array:
-    order = jnp.argsort(theta[..., 0], axis=-1)
+    key = jnp.linalg.norm(theta, axis=-1)
+    order = jnp.argsort(key, axis=-1, stable=True)
     return jnp.take_along_axis(theta, order[..., None], axis=-2)
 
 
 def canonicalize_padded_sources_np(theta: np.ndarray, num_sources: int) -> np.ndarray:
-    """Canonicalize only the active source rows, keeping padding at the end."""
+    """Canonicalize active source rows by norm, keeping inactive padding at the end."""
     theta = np.asarray(theta)
     indices = np.arange(theta.shape[-2])
-    key = np.where(indices < int(num_sources), theta[..., 0], np.inf)
-    order = np.argsort(key, axis=-1)
+    source_norm = np.linalg.norm(theta, axis=-1)
+    key = np.where(indices < int(num_sources), source_norm, np.inf)
+    order = np.argsort(key, axis=-1, kind="stable")
     return np.take_along_axis(theta, order[..., None], axis=-2)
 
 
 def canonicalize_padded_sources_jax(theta: Array, num_sources: Array) -> Array:
     indices = jnp.arange(theta.shape[-2])
-    key = jnp.where(indices < num_sources, theta[..., 0], jnp.inf)
-    order = jnp.argsort(key, axis=-1)
+    source_norm = jnp.linalg.norm(theta, axis=-1)
+    key = jnp.where(indices < num_sources, source_norm, jnp.inf)
+    order = jnp.argsort(key, axis=-1, stable=True)
     return jnp.take_along_axis(theta, order[..., None], axis=-2)
+
+
+def canonicalize_designs_np(designs: np.ndarray) -> np.ndarray:
+    """Sort design points within each observation block by increasing norm to the origin."""
+    designs = np.asarray(designs)
+    key = np.linalg.norm(designs, axis=-1)
+    order = np.argsort(key, axis=-1, kind="stable")
+    return np.take_along_axis(designs, order[..., None], axis=-2)
+
+
+def canonicalize_observation_block_np(observations: np.ndarray, source_dim: int) -> np.ndarray:
+    """Sort design-outcome rows by design norm while keeping each outcome paired with its design."""
+    observations = np.asarray(observations)
+    key = np.linalg.norm(observations[..., : int(source_dim)], axis=-1)
+    order = np.argsort(key, axis=-1, kind="stable")
+    return np.take_along_axis(observations, order[..., None], axis=-2)
+
+
+def canonicalize_observation_block_jax(
+    observations: Array,
+    num_sources: Array,
+    theta_size: Array,
+) -> Array:
+    """JAX form of norm-ordering for one padded design-outcome observation block."""
+    source_dim = theta_size // num_sources
+    coordinate_index = jnp.arange(observations.shape[-1] - 1)
+    valid_coordinate = coordinate_index < source_dim
+    design = observations[..., :-1]
+    design = jnp.where(valid_coordinate, design, 0.0)
+    key = jnp.linalg.norm(design, axis=-1)
+    order = jnp.argsort(key, axis=-1, stable=True)
+    return jnp.take_along_axis(observations, order[..., None], axis=-2)
 
 
 #%% 5) Token helpers shared by the dimension and posterior Transformers
@@ -1595,8 +1648,8 @@ class FixedShapeThetaEmbedder(eqx.Module):
 class ThetaDimensionEmbedder(eqx.Module):
     """TAMO-style dimension aggregator for one padded source configuration theta.
 
-    Before flattening, exchangeable source rows are canonicalized by their first active
-    coordinate.  We then compact the active [S,D] block into the FIRST S*D scalar slots
+    Before flattening, exchangeable source rows are canonicalized by increasing Euclidean
+    norm to the origin.  We then compact the active [S,D] block into the FIRST S*D scalar slots
     using dynamic gather indices.  This is the important flattening detail: simply
     reshaping the padded [Smax,Dmax] array would interleave inactive padding whenever
     D < Dmax and would make theta_size metadata incorrect.
@@ -2192,6 +2245,9 @@ class SequentialBayesModel(eqx.Module):
         num_sources: Array,
         theta_size: Array,
     ) -> Array:
+        observations = canonicalize_observation_block_jax(
+            observations, num_sources, theta_size
+        )
         pair_embeddings = jax.vmap(
             lambda observation: self.observation_embedder(
                 observation, num_sources, theta_size
@@ -2236,7 +2292,7 @@ class SequentialBayesModel(eqx.Module):
             lambda theta: self.theta_embedder(theta, num_sources, theta_size)
         )(padded)
 
-    def _canonicalize_compact_output(
+    def _canonicalize_compact_input(
         self,
         compact_particles: Array,
         num_sources: Array,
@@ -2244,6 +2300,7 @@ class SequentialBayesModel(eqx.Module):
         max_num_sources: int,
         max_source_dim: int,
     ) -> Array:
+        """Canonicalize a compact cloud immediately before it is reused as a model input."""
         if not self.theta_embedder.canonicalize:
             return compact_particles
         padded = jax.vmap(
@@ -2262,6 +2319,18 @@ class SequentialBayesModel(eqx.Module):
             lambda theta: compact_theta_jax(theta, num_sources, theta_size)
         )(padded)
 
+    def _canonicalize_compact_output(
+        self,
+        compact_particles: Array,
+        num_sources: Array,
+        theta_size: Array,
+        max_num_sources: int,
+        max_source_dim: int,
+    ) -> Array:
+        """Return posterior output unchanged; canonical order is expected rather than imposed."""
+        del num_sources, theta_size, max_num_sources, max_source_dim
+        return compact_particles
+
     def _transport_compact_with_contexts(
         self,
         current_theta: Array,          # [N,Kmax]
@@ -2273,6 +2342,13 @@ class SequentialBayesModel(eqx.Module):
         max_source_dim: int,
     ) -> Array:
         """Apply one Bayes-map step to an already compact cloud using precomputed contexts."""
+        current_theta = self._canonicalize_compact_input(
+            current_theta,
+            num_sources,
+            theta_size,
+            max_num_sources,
+            max_source_dim,
+        )
         current_embeddings = self._embed_compact_cloud(
             current_theta,
             num_sources,
@@ -2359,6 +2435,13 @@ class SequentialBayesModel(eqx.Module):
         )(observations)  # final width is observation_input_dim in bypass, likelihood_hidden_dim otherwise
 
         def scan_step(current_theta: Array, contexts: Array):
+            current_theta = self._canonicalize_compact_input(
+                current_theta,
+                num_sources,
+                theta_size,
+                prior_particles.shape[-2],
+                prior_particles.shape[-1],
+            )
             current_embeddings = self._embed_compact_cloud(
                 current_theta,
                 num_sources,
@@ -5826,8 +5909,8 @@ def structural_checks(
     3. Memory causality: contextual observation memories through t ignore future blocks.
     4. Particle equivariance: permute the particle axis, undo it on outputs, verify equality.
 
-    Observation order is intentionally meaningful because the causal encoder builds ordered
-    prefixes and the evaluation rollout applies Bayes updates in arrival order.
+    Observation order is intentionally meaningful: designs inside each block use canonical
+    norm order, while the evaluation rollout still applies distinct Bayes updates in arrival order.
     """
     obs = _ensure_observation_blocks_np(trajectory["observations"])
     observation_count = _trajectory_observation_count_np(trajectory, cfg)
@@ -5852,8 +5935,11 @@ def structural_checks(
     cutoff = int((cfg.min_observations_per_step + cfg.max_observations_per_step) // 2)
     direct_perturbed_obs = obs[0].copy()
     if cutoff < direct_perturbed_obs.shape[0]:
-        direct_perturbed_obs[cutoff:, :D] = rng.uniform(
-            cfg.design_low, cfg.design_high, size=direct_perturbed_obs[cutoff:, :D].shape
+        # Preserve each suffix design norm so canonical sorting cannot move a perturbed row
+        # into the protected prefix; random sign flips still change the physical design.
+        direct_perturbed_obs[cutoff:, :D] *= rng.choice(
+            np.asarray([-1.0, 1.0], dtype=np.float32),
+            size=direct_perturbed_obs[cutoff:, :D].shape,
         )
         direct_perturbed_obs[cutoff:, -1] += rng.normal(
             0.0, 5.0, size=direct_perturbed_obs[cutoff:, -1].shape
@@ -5871,12 +5957,15 @@ def structural_checks(
 
     future_perturbed = obs.copy()
     if t < len(obs):
-        future_perturbed[t:, :, :D] = rng.uniform(
-            cfg.design_low, cfg.design_high, size=future_perturbed[t:, :, :D].shape
+        future_perturbed[t:, :, :D] = canonicalize_designs_np(
+            rng.uniform(
+                cfg.design_low, cfg.design_high, size=future_perturbed[t:, :, :D].shape
+            )
         )
         future_perturbed[t:, :, -1] += rng.normal(
             0.0, 5.0, size=future_perturbed[t:, :, -1].shape
         )
+        future_perturbed[t:] = canonicalize_observation_block_np(future_perturbed[t:], D)
     causal_output, causal_conditions, _ = model(
         jnp.asarray(prior), jnp.asarray(future_perturbed), jnp.asarray(observation_count),
         jnp.asarray(S), jnp.asarray(theta_size)

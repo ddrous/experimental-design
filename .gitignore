@@ -3,6 +3,7 @@
 
 source-loc/flow-matching/runs/
 source-loc/world-model/runs/
+reinforce/cartpole_out/
 
 
 *eqx
