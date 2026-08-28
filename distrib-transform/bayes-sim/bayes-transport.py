@@ -250,7 +250,7 @@ class BayesTransportConfig:
     # Optimisation. The scalar differentiated loss is selected above. The direct empirical
     # energy score is still reported for every mode and remains the validation/model-selection
     # metric, preserving the original evaluation protocol.
-    epochs: int = 5000
+    epochs: int = 10000
     learning_rate: float = 1e-5
     weight_decay: float = 1e-4
     grad_clip_norm: float = 1000.0

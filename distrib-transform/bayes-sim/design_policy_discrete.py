@@ -18,17 +18,18 @@ Core loop
    Bayes-map call after the policy action. In JOINT ALINE-style mode, the shared posterior Transformer
    returns both the posterior cloud and the features used to emit the NEXT design set in one call.
    Genuine multi-observation checkpoints consume the K observations jointly with observation_count=K.
-5. Reward the policy using the configured posterior loss and time reference.
-   ``reward_reference='initial'`` gives dense prefix improvement loss(C_0)-loss(C_t),
-   ``reward_reference='previous'`` gives one-step improvement loss(C_{t-1})-loss(C_t), and
-   ``reward_reference='terminal'`` gives zero reward before the final step and -loss(C_T) at T.
+5. Reward the policy by the improvement between consecutive posterior clouds.  The default
+   ``reward_mode='attraction'`` uses the first term of the empirical energy score (mean distance to
+   theta*).  ``reward_mode='energy_score'`` uses the full proper energy score, retaining the
+   repulsion/spread term.
 6. Repeat with the posterior cloud as the next prior.
 
 Gradient estimators
 -------------------
-``gradient_estimator='pathwise'`` differentiates through the reparameterised policy action,
-Gaussian likelihood sample, and frozen Bayes Transport.  This is the pathwise/reparameterisation
-estimator of Mohamed et al. (2020), Eq. 29.
+``gradient_estimator='pathwise'`` differentiates through a straight-through Gumbel-Softmax
+relaxation of the discrete policy action, the Gaussian likelihood sample, and frozen Bayes Transport.
+This keeps the optional pathwise mode available while the default REINFORCE mode uses exact
+categorical score-function gradients.
 
 ``gradient_estimator='reinforce'`` detaches sampled actions/environment transitions and uses the
 score-function / REINFORCE estimator.  The default dense reward mirrors ALINE's idea of using
@@ -105,13 +106,9 @@ class PolicyConfig:
     no fixed-point solver, no drifting field, and no replay buffer.
     """
 
-    # Reproducibility.  `seed` remains the run/model-construction seed used by the archived script.
-    # In evaluation-only mode, `evaluation_seed` controls all freshly generated evaluation truths,
-    # priors, random baselines, observation noise, policy sampling keys and sPCE contrastives.
-    # None => use `seed`, so simply changing `seed` also changes the evaluation trajectories.
+    # Reproducibility.  Keep the exact Bayes-Transport seed by default so the fixed diagnostic
+    # uses the same theta* and prior cloud stored by the original run.
     seed: int = 2030
-    # seed: int = 230
-    evaluation_seed: int | None = None
 
     # The script is executed from the Bayes-Transport run folder.
     bayes_artifact_dir: str = "./artefacts"
@@ -121,15 +118,9 @@ class PolicyConfig:
     bayes_transport_source_script: str | None = None
 
     # Policy run bookkeeping.  Policy checkpoints/plots never overwrite Bayes-Transport artefacts.
-    # Evaluation-only default: when False, no optimizer step or Bayes fine-tuning step is executed.
-    # If policy_reload_dir is None, an archived copy of this script automatically uses its own folder
-    # when that folder contains artefacts/policy_last.eqx. Otherwise set the completed policy run here.
     train_policy: bool = True
     policy_runs_base: str = "./policy_runs"
     policy_reload_dir: str | None = None
-    # Evaluation-only outputs are written here, relative to the completed policy run, so rerunning
-    # diagnostics with different evaluation settings never overwrites the original training outputs.
-    evaluation_output_subdir: str = "reanalysis"
 
     # Sequential experimental-design problem.
     # Experimental budget = number of sequential policy decisions in ONE episode.
@@ -139,14 +130,9 @@ class PolicyConfig:
     # K outcomes are passed to that Bayes map JOINTLY as one K-observation prefix.  Thus K is also
     # the observation count used by the pretrained map at each policy decision.
     # The BED benchmark default is deliberately 30 sequential decisions.
-    experimental_budget: int = 16
+    experimental_budget: int = 30
     designs_per_step: int = 1            # K designs proposed JOINTLY at each policy decision.
     num_particles: int = 32              # empirical belief-cloud size seen by the policy.
-    # True: C_t is recomputed from the episode base prior plus the full observed history.
-    # False: repeated-Bayes mode reuses the current posterior and conditions only on the new block.
-    use_cumulative_observations: bool = True
-    # One switch for all norm-based source/design input canonicalisation; False disables it completely.
-    canonicalize_inputs_by_norm: bool = False
 
     # Shape distribution for policy training, using the SAME min/max convention as the original
     # Bayes-Transport codebase. For a dimension-agnostic Bayes checkpoint, downstream shapes only
@@ -189,8 +175,8 @@ class PolicyConfig:
     #   4) posterior Transformer.
     #
     # If ALL FOUR are True, the script automatically enters the JOINT ALINE-style regime below:
-    # the Bayes backbone is reused as one integrated inference/acquisition network and a continuous
-    # set-valued acquisition head is attached to the posterior Transformer features. Otherwise the
+    # the Bayes backbone is reused as one integrated inference/acquisition network and a discrete
+    # categorical acquisition head is attached to the posterior Transformer features. Otherwise the
     # existing SEPARATE policy architecture is used, optionally borrowing the selected components.
     #
     # In the SEPARATE regime, a fixed downstream policy uses fresh trainable linear projections,
@@ -221,7 +207,9 @@ class PolicyConfig:
     joint_aline_ff_dim: int = 128
     joint_aline_head_width: int = 128
 
-    # Continuous bounded stochastic policy: z ~ Normal(mu,sigma), x = box_map(tanh(z)).
+    # Discrete bounded stochastic policy: emit logits over a fixed design-space query pool.
+    # Keep the existing scale hyperparameters unchanged; they now set/clamp the categorical
+    # temperature so old experiment configurations retain the same exploration control knobs.
     initial_policy_std: float = 0.55
     min_policy_std: float = 0.03
     max_policy_std: float = 1.50
@@ -232,17 +220,7 @@ class PolicyConfig:
 
     # Gradient estimator and reward.
     gradient_estimator: str = "reinforce"   # {"pathwise", "reinforce"}
-    # Posterior loss/score used by the reward.  All modes work with all reward references below.
-    # "particle_max_mse" is the worst per-particle MSE; "mean_log_mse" is the mean across particles
-    # of log(per-particle MSE + eps).  Posterior-mean and robust particle alternatives are included too.
-    reward_mode: str = "mean_log_mse"      # {"energy_score", "attraction", "posterior_mean_mse",
-                                          #  "posterior_mean_rmse", "particle_mean_mse",
-                                          #  "particle_max_mse", "particle_median_mse",
-                                          #  "mean_log_mse", "log_mean_mse"}
-    # "initial":  r_t = loss(C_0) - loss(C_t), giving every posterior prefix direct reward signal.
-    # "previous": r_t = loss(C_{t-1}) - loss(C_t), retaining the original one-step improvement.
-    # "terminal": r_t = 0 for t<T and r_T = -loss(C_T): only the final posterior defines the reward.
-    reward_reference: str = "initial"      # {"initial", "previous", "terminal"}
+    reward_mode: str = "energy_score"        # {"attraction", "energy_score"}
     discount_gamma: float = 1.0
     reward_scale: float = 1.0
     reward_clip: float | None = None
@@ -258,7 +236,7 @@ class PolicyConfig:
     # Bayes Transport is frozen by default.  If enabled, it is fine-tuned in a SEPARATE auxiliary
     # energy-score step on data induced by the current policy; the policy objective never silently
     # changes meaning.  This mirrors ALINE's separation of policy and inference objectives.
-    finetune_bayes_transport: bool = True
+    finetune_bayes_transport: bool = False
     bayes_finetune_learning_rate: float = 1e-6
     bayes_finetune_weight_decay: float = 1e-5
     bayes_finetune_grad_clip_norm: float = 10.0
@@ -272,15 +250,13 @@ class PolicyConfig:
     # unit rather than a pass over a finite dataset.  The defaults retain 50,000 optimizer updates.
     epochs: int = 250*1
     train_steps_per_epoch: int = 128
-    batch_size: int = 16*4*1
-    learning_rate: float = 1e-5
-    weight_decay: float = 1e-6
+    batch_size: int = 2
+    learning_rate: float = 1e-6
+    weight_decay: float = 1e-5
     grad_clip_norm: float = 10.0
 
     # Evaluation and persistence cadence, expressed in EPOCHS.  With the default 100 fresh
     # optimizer steps per epoch these correspond to the old 1k/5k/1k step cadences.
-    # When train_policy=False, the evaluation-only knobs below may be changed freely without
-    # retraining or changing the saved policy architecture.
     eval_every_epochs: int = 10
     save_every_epochs: int = 50
     plot_every_epochs: int = 10
@@ -293,18 +269,13 @@ class PolicyConfig:
     eig_eval_trajectories: int = 64
     credible_interval_mass: float = 0.90
 
-    # Plotting / diagnostics.
+    # Plotting / diagnostics. The same existing grid_size also fixes the discrete policy query-pool size.
     grid_size: int = 180
     confidence_z: float = 1.96
     final_plot_examples: int = 3
 
 
 POLICY_CFG = PolicyConfig()
-
-
-def evaluation_seed(cfg: PolicyConfig) -> int:
-    """Seed used only for fresh evaluation/reanalysis randomness."""
-    return int(cfg.seed if cfg.evaluation_seed is None else cfg.evaluation_seed)
 
 
 def policy_is_fixed_shape(cfg: PolicyConfig) -> bool:
@@ -357,6 +328,8 @@ def validate_policy_config(cfg: PolicyConfig):
         raise ValueError("heldout_shapes cannot remove every policy-training shape.")
     if cfg.designs_per_step < 1:
         raise ValueError("designs_per_step must be >= 1.")
+    if cfg.grid_size < cfg.designs_per_step:
+        raise ValueError("grid_size must be >= designs_per_step for discrete sampling without replacement.")
     if cfg.num_particles < 2:
         raise ValueError("num_particles must be >= 2 for empirical-cloud energy scores.")
     if cfg.policy_hidden_dim % cfg.policy_heads != 0:
@@ -375,24 +348,8 @@ def validate_policy_config(cfg: PolicyConfig):
         )
     if cfg.gradient_estimator not in {"pathwise", "reinforce"}:
         raise ValueError("gradient_estimator must be 'pathwise' or 'reinforce'.")
-    supported_reward_modes = {
-        "energy_score",
-        "attraction",
-        "posterior_mean_mse",
-        "posterior_mean_rmse",
-        "particle_mean_mse",
-        "particle_max_mse",
-        "particle_median_mse",
-        "mean_log_mse",
-        "log_mean_mse",
-    }
-    if cfg.reward_mode not in supported_reward_modes:
-        raise ValueError(
-            f"Unsupported reward_mode={cfg.reward_mode!r}. "
-            f"Choose one of {sorted(supported_reward_modes)}."
-        )
-    if cfg.reward_reference not in {"initial", "previous", "terminal"}:
-        raise ValueError("reward_reference must be 'initial', 'previous', or 'terminal'.")
+    if cfg.reward_mode not in {"attraction", "energy_score"}:
+        raise ValueError("reward_mode must be 'attraction' or 'energy_score'.")
     if cfg.reinforce_credit_assignment not in {"dense", "return_to_go"}:
         raise ValueError("Unsupported reinforce_credit_assignment.")
     if cfg.reinforce_baseline not in {"none", "ema"}:
@@ -512,54 +469,20 @@ def discover_bayes_transport_source(cfg: PolicyConfig) -> Path | None:
 
     cwd = Path.cwd().resolve()
     this_file = Path(__file__).resolve() if "__file__" in globals() else None
-
-    # Normally the script is run from the Bayes-Transport run directory.  For evaluation-only use,
-    # also search ancestors of the archived policy script / configured policy run so the copied script
-    # can be executed directly from policy_runs/<run>/ without manually changing the working directory.
-    search_roots: list[Path] = [cwd]
-    if cfg.policy_reload_dir is not None:
-        reload_dir = Path(cfg.policy_reload_dir).expanduser().resolve()
-        search_roots.extend([reload_dir, *reload_dir.parents])
-    if this_file is not None:
-        search_roots.extend([this_file.parent, *this_file.parent.parents])
-
-    unique_roots: list[Path] = []
-    seen_roots: set[Path] = set()
-    for root in search_roots:
-        root = root.resolve()
-        if root not in seen_roots:
-            seen_roots.add(root)
-            unique_roots.append(root)
-
     candidates: list[Path] = []
-    for root in unique_roots:
-        for path in sorted(root.glob("*.py")):
-            if this_file is not None and path.resolve() == this_file:
-                continue
-            try:
-                prefix = path.read_text(encoding="utf-8", errors="replace")[:250_000]
-            except OSError:
-                continue
-            # Policy scripts also contain compatibility copies of these classes; do not mistake a
-            # second policy script for the archived Bayes-Transport training source.
-            if (
-                "class BayesTransportConfig" in prefix
-                and "class SequentialBayesModel" in prefix
-                and "class PolicyConfig" not in prefix
-            ):
-                candidates.append(path)
-
+    for path in sorted(cwd.glob("*.py")):
+        if this_file is not None and path.resolve() == this_file:
+            continue
+        try:
+            prefix = path.read_text(encoding="utf-8", errors="replace")[:250_000]
+        except OSError:
+            continue
+        if "class BayesTransportConfig" in prefix and "class SequentialBayesModel" in prefix:
+            candidates.append(path)
     if not candidates:
         return None
-    # Prefer filenames that look like the archived training script, then the closest discovered path.
-    candidates.sort(
-        key=lambda p: (
-            "bayes" not in p.name.lower(),
-            "transport" not in p.name.lower(),
-            len(p.parts),
-            p.name,
-        )
-    )
+    # Prefer filenames that look like the archived training script.
+    candidates.sort(key=lambda p: ("bayes" not in p.name.lower(), "transport" not in p.name.lower(), p.name))
     return candidates[0]
 
 
@@ -578,9 +501,6 @@ def recover_bayes_transport_config(cfg: PolicyConfig) -> tuple[BayesTransportCon
 
 
 BT_CFG, BAYES_SOURCE_SCRIPT = recover_bayes_transport_config(POLICY_CFG)
-BT_CFG = replace(
-    BT_CFG, canonicalize_particle_sources=bool(POLICY_CFG.canonicalize_inputs_by_norm)
-)
 
 
 def validate_bayes_compatibility_config(cfg: BayesTransportConfig):
@@ -773,14 +693,10 @@ def sample_base_prior_np(
     """Same base-prior sampler as the Bayes-Transport script."""
     shape = (int(n), int(num_sources), int(source_dim))
     if cfg.base_prior_distribution == "uniform":
-        samples = rng.uniform(cfg.design_low, cfg.design_high, size=shape).astype(np.float32)
-    elif cfg.base_prior_distribution == "gaussian":
-        samples = rng.normal(0.0, cfg.prior_std, size=shape).astype(np.float32)
-    else:
-        raise ValueError("base_prior_distribution must be 'uniform' or 'gaussian'.")
-    if cfg.canonicalize_particle_sources:
-        samples = canonicalize_sources_np(samples)
-    return samples
+        return rng.uniform(cfg.design_low, cfg.design_high, size=shape).astype(np.float32)
+    if cfg.base_prior_distribution == "gaussian":
+        return rng.normal(0.0, cfg.prior_std, size=shape).astype(np.float32)
+    raise ValueError("base_prior_distribution must be 'uniform' or 'gaussian'.")
 
 
 def pad_theta_np(theta: np.ndarray, cfg: BayesTransportConfig) -> np.ndarray:
@@ -836,74 +752,31 @@ def _base_prior_plot_extent(cfg: BayesTransportConfig) -> float:
 # the run folder and can reconstruct Equinox checkpoints without executing the original training file.
 #%% 4a) Source-label symmetry helpers
 def canonicalize_sources_np(theta: np.ndarray) -> np.ndarray:
-    """Sort ACTIVE exchangeable sources by increasing Euclidean norm to the origin."""
+    """Sort ACTIVE exchangeable sources by their first coordinate."""
     theta = np.asarray(theta)
-    key = np.linalg.norm(theta, axis=-1)
-    order = np.argsort(key, axis=-1, kind="stable")
+    order = np.argsort(theta[..., 0], axis=-1)
     return np.take_along_axis(theta, order[..., None], axis=-2)
 
 
 def canonicalize_sources_jax(theta: Array) -> Array:
-    key = jnp.linalg.norm(theta, axis=-1)
-    order = jnp.argsort(key, axis=-1, stable=True)
+    order = jnp.argsort(theta[..., 0], axis=-1)
     return jnp.take_along_axis(theta, order[..., None], axis=-2)
 
 
 def canonicalize_padded_sources_np(theta: np.ndarray, num_sources: int) -> np.ndarray:
-    """Canonicalize active source rows by norm, keeping inactive padding at the end."""
+    """Canonicalize only the active source rows, keeping padding at the end."""
     theta = np.asarray(theta)
     indices = np.arange(theta.shape[-2])
-    source_norm = np.linalg.norm(theta, axis=-1)
-    key = np.where(indices < int(num_sources), source_norm, np.inf)
-    order = np.argsort(key, axis=-1, kind="stable")
+    key = np.where(indices < int(num_sources), theta[..., 0], np.inf)
+    order = np.argsort(key, axis=-1)
     return np.take_along_axis(theta, order[..., None], axis=-2)
 
 
 def canonicalize_padded_sources_jax(theta: Array, num_sources: Array) -> Array:
     indices = jnp.arange(theta.shape[-2])
-    source_norm = jnp.linalg.norm(theta, axis=-1)
-    key = jnp.where(indices < num_sources, source_norm, jnp.inf)
-    order = jnp.argsort(key, axis=-1, stable=True)
+    key = jnp.where(indices < num_sources, theta[..., 0], jnp.inf)
+    order = jnp.argsort(key, axis=-1)
     return jnp.take_along_axis(theta, order[..., None], axis=-2)
-
-
-def canonicalize_designs_np(designs: np.ndarray) -> np.ndarray:
-    """Sort design points within each observation block by increasing norm to the origin."""
-    designs = np.asarray(designs)
-    key = np.linalg.norm(designs, axis=-1)
-    order = np.argsort(key, axis=-1, kind="stable")
-    return np.take_along_axis(designs, order[..., None], axis=-2)
-
-
-def canonicalize_observation_block_np(
-    observations: np.ndarray, source_dim: int, valid_rows: np.ndarray | None = None
-) -> np.ndarray:
-    """Sort design-outcome rows by design norm while keeping each outcome paired with its design."""
-    observations = np.asarray(observations)
-    key = np.linalg.norm(observations[..., : int(source_dim)], axis=-1)
-    if valid_rows is not None:
-        key = np.where(np.asarray(valid_rows, dtype=bool), key, np.inf)
-    order = np.argsort(key, axis=-1, kind="stable")
-    return np.take_along_axis(observations, order[..., None], axis=-2)
-
-
-def canonicalize_observation_block_jax(
-    observations: Array,
-    num_sources: Array,
-    theta_size: Array,
-    valid_rows: Array | None = None,
-) -> Array:
-    """JAX form of norm-ordering for one padded design-outcome observation block."""
-    source_dim = theta_size // num_sources
-    coordinate_index = jnp.arange(observations.shape[-1] - 1)
-    valid_coordinate = coordinate_index < source_dim
-    design = observations[..., :-1]
-    design = jnp.where(valid_coordinate, design, 0.0)
-    key = jnp.linalg.norm(design, axis=-1)
-    if valid_rows is not None:
-        key = jnp.where(valid_rows, key, jnp.inf)
-    order = jnp.argsort(key, axis=-1, stable=True)
-    return jnp.take_along_axis(observations, order[..., None], axis=-2)
 
 
 #%% 4b) Token helpers shared by the dimension and posterior Transformers
@@ -1140,8 +1013,8 @@ class FixedShapeThetaEmbedder(eqx.Module):
 class ThetaDimensionEmbedder(eqx.Module):
     """TAMO-style dimension aggregator for one padded source configuration theta.
 
-    Before flattening, exchangeable source rows are canonicalized by increasing Euclidean
-    norm to the origin.  We then compact the active [S,D] block into the FIRST S*D scalar slots
+    Before flattening, exchangeable source rows are canonicalized by their first active
+    coordinate.  We then compact the active [S,D] block into the FIRST S*D scalar slots
     using dynamic gather indices.  This is the important flattening detail: simply
     reshaping the padded [Smax,Dmax] array would interleave inactive padding whenever
     D < Dmax and would make theta_size metadata incorrect.
@@ -1817,12 +1690,7 @@ class SequentialBayesModel(eqx.Module):
         observations: Array,          # [Omax,Dmax+1]
         num_sources: Array,
         theta_size: Array,
-        valid_rows: Array | None = None,
     ) -> Array:
-        if self.theta_embedder.canonicalize:
-            observations = canonicalize_observation_block_jax(
-                observations, num_sources, theta_size, valid_rows
-            )
         pair_embeddings = jax.vmap(
             lambda observation: self.observation_embedder(
                 observation, num_sources, theta_size
@@ -1867,7 +1735,7 @@ class SequentialBayesModel(eqx.Module):
             lambda theta: self.theta_embedder(theta, num_sources, theta_size)
         )(padded)
 
-    def _canonicalize_compact_input(
+    def _canonicalize_compact_output(
         self,
         compact_particles: Array,
         num_sources: Array,
@@ -1875,7 +1743,6 @@ class SequentialBayesModel(eqx.Module):
         max_num_sources: int,
         max_source_dim: int,
     ) -> Array:
-        """Canonicalize a compact cloud immediately before it is reused as a model input."""
         if not self.theta_embedder.canonicalize:
             return compact_particles
         padded = jax.vmap(
@@ -1894,19 +1761,6 @@ class SequentialBayesModel(eqx.Module):
             lambda theta: compact_theta_jax(theta, num_sources, theta_size)
         )(padded)
 
-    def _canonicalize_compact_output(
-        self,
-        compact_particles: Array,
-        num_sources: Array,
-        theta_size: Array,
-        max_num_sources: int,
-        max_source_dim: int,
-    ) -> Array:
-        """Return posterior output unchanged; canonical order is expected rather than imposed."""
-        del num_sources, theta_size, max_num_sources, max_source_dim
-        return compact_particles
-
-
     def _transport_compact_with_contexts(
         self,
         current_theta: Array,          # [N,Kmax]
@@ -1918,13 +1772,6 @@ class SequentialBayesModel(eqx.Module):
         max_source_dim: int,
     ) -> Array:
         """Apply one Bayes-map step to an already compact cloud using precomputed contexts."""
-        current_theta = self._canonicalize_compact_input(
-            current_theta,
-            num_sources,
-            theta_size,
-            max_num_sources,
-            max_source_dim,
-        )
         current_embeddings = self._embed_compact_cloud(
             current_theta,
             num_sources,
@@ -2011,13 +1858,6 @@ class SequentialBayesModel(eqx.Module):
         )(observations)  # final width is observation_input_dim in bypass, likelihood_hidden_dim otherwise
 
         def scan_step(current_theta: Array, contexts: Array):
-            current_theta = self._canonicalize_compact_input(
-                current_theta,
-                num_sources,
-                theta_size,
-                prior_particles.shape[-2],
-                prior_particles.shape[-1],
-            )
             current_embeddings = self._embed_compact_cloud(
                 current_theta,
                 num_sources,
@@ -2046,47 +1886,19 @@ class SequentialBayesModel(eqx.Module):
 
 #%% 5) Load the pretrained Bayes Transport checkpoint
 def find_bayes_checkpoint(cfg: PolicyConfig) -> Path:
-    artifact_dirs: list[Path] = [Path(cfg.bayes_artifact_dir).expanduser().resolve()]
-
-    # The recovered archived Bayes source is the strongest fallback: its sibling artefacts directory
-    # is the checkpoint directory used by that Bayes-Transport run.
-    if BAYES_SOURCE_SCRIPT is not None:
-        artifact_dirs.append(BAYES_SOURCE_SCRIPT.parent / "artefacts")
-
-    # Evaluation-only archived policy copies usually live at
-    # <bayes-run>/policy_runs/<policy-run>/design_policy.py. Search ancestors as a final convenience.
-    this_file = Path(__file__).resolve() if "__file__" in globals() else None
-    roots: list[Path] = []
-    if cfg.policy_reload_dir is not None:
-        reload_dir = Path(cfg.policy_reload_dir).expanduser().resolve()
-        roots.extend([reload_dir, *reload_dir.parents])
-    if this_file is not None:
-        roots.extend([this_file.parent, *this_file.parent.parents])
-    artifact_dirs.extend(root / "artefacts" for root in roots)
-
-    unique_dirs: list[Path] = []
-    seen_dirs: set[Path] = set()
-    for artifact_dir in artifact_dirs:
-        artifact_dir = artifact_dir.resolve()
-        if artifact_dir not in seen_dirs:
-            seen_dirs.add(artifact_dir)
-            unique_dirs.append(artifact_dir)
-
-    searched: list[str] = []
-    for artifact_dir in unique_dirs:
-        searched.append(str(artifact_dir))
-        requested = artifact_dir / cfg.bayes_checkpoint
-        if requested.is_file():
-            return requested
-        fallbacks = [artifact_dir / "model_best.eqx", artifact_dir / "model_last.eqx"]
-        fallbacks.extend(sorted(artifact_dir.glob("model_epoch_*.eqx"), reverse=True))
-        for candidate in fallbacks:
-            if candidate.is_file():
-                print(f"Requested checkpoint not found; falling back to {candidate}")
-                return candidate
-
+    artifact_dir = Path(cfg.bayes_artifact_dir).expanduser().resolve()
+    requested = artifact_dir / cfg.bayes_checkpoint
+    if requested.is_file():
+        return requested
+    fallbacks = [artifact_dir / "model_best.eqx", artifact_dir / "model_last.eqx"]
+    fallbacks.extend(sorted(artifact_dir.glob("model_epoch_*.eqx"), reverse=True))
+    for candidate in fallbacks:
+        if candidate.is_file():
+            print(f"Requested checkpoint not found; falling back to {candidate.name}")
+            return candidate
     raise FileNotFoundError(
-        "No Bayes-Transport checkpoint found. Searched: " + ", ".join(searched)
+        f"No Bayes-Transport checkpoint found in {artifact_dir}. "
+        "Run this script from the completed Bayes-Transport run directory."
     )
 
 
@@ -2218,9 +2030,9 @@ class ALINEAcquisitionBlock(eqx.Module):
 
     ALINE's architecture uses a context set for acquired observations, a target set for the
     inference target, and a query set for candidate acquisitions.  Here the target set is the
-    current/post-update posterior-particle representation and the query set is a learned set of K
-    continuous design tokens.  The final acquisition head differs from ALINE's pool softmax because
-    this project emits a continuous design set.
+    current/post-update posterior-particle representation and the K learned query tokens summarize
+    the K jointly proposed acquisitions.  The final acquisition head now emits logits over a fixed
+    discrete design-space query pool and Softmax turns those logits into the categorical policy.
     """
     query_norm: eqx.nn.LayerNorm
     context_query_norm: eqx.nn.LayerNorm
@@ -2323,13 +2135,17 @@ def _policy_pad_cloud(
     max_num_sources: int,
     max_source_dim: int,
 ) -> Array:
-    """Return padded [N,Smax,Dmax] cloud storage without canonicalizing posterior output."""
-    del theta_embedder
-    return jax.vmap(
+    """Canonicalize (if requested) and return padded [N,Smax,Dmax] cloud storage."""
+    padded = jax.vmap(
         lambda theta: padded_theta_jax(
             theta, num_sources, theta_size, max_num_sources, max_source_dim
         )
     )(compact_cloud)
+    if theta_embedder.canonicalize:
+        padded = jax.vmap(
+            lambda theta: canonicalize_padded_sources_jax(theta, num_sources)
+        )(padded)
+    return padded
 
 
 def _embedder_output_dim(
@@ -2403,8 +2219,7 @@ class SeparateDesignPolicy(eqx.Module):
     cloud_history_blocks: tuple[CloudHistoryCrossBlock, ...]
     decoder_blocks: tuple[DesignDecoderBlock, ...]
     final_norm: eqx.nn.LayerNorm
-    mean_head: eqx.nn.Linear
-    log_std_head: eqx.nn.Linear
+    logits_head: eqx.nn.Linear
 
     empty_history_token: Array
     history_position: Array
@@ -2474,10 +2289,8 @@ class SeparateDesignPolicy(eqx.Module):
             for _ in range(cfg.decoder_depth)
         )
         self.final_norm = eqx.nn.LayerNorm(self.hidden_dim)
-        self.mean_head = eqx.nn.Linear(self.hidden_dim, self.max_source_dim, key=next(keys))
-        self.log_std_head = eqx.nn.Linear(self.hidden_dim, self.max_source_dim, key=next(keys))
+        self.logits_head = eqx.nn.Linear(self.hidden_dim, cfg.grid_size, key=next(keys))
 
-        init_std_log = float(math.log(max(cfg.initial_policy_std, 1e-5)))
         self.empty_history_token = 0.02 * jax.random.normal(next(keys), (self.hidden_dim,))
         self.history_position = 0.02 * jax.random.normal(
             next(keys), (self.max_history + 1, self.hidden_dim)
@@ -2487,13 +2300,6 @@ class SeparateDesignPolicy(eqx.Module):
         )
         self.step_embedding = 0.02 * jax.random.normal(
             next(keys), (cfg.experimental_budget, self.hidden_dim)
-        )
-        self.log_std_head = eqx.tree_at(
-            lambda layer: layer.weight, self.log_std_head, jnp.zeros_like(self.log_std_head.weight)
-        )
-        self.log_std_head = eqx.tree_at(
-            lambda layer: layer.bias, self.log_std_head,
-            jnp.full_like(self.log_std_head.bias, init_std_log),
         )
 
     def _history_contexts(self, history: Array, history_valid: Array,
@@ -2510,7 +2316,7 @@ class SeparateDesignPolicy(eqx.Module):
         return jnp.where(history_valid[:, None], contexts, 0.0)
 
     def __call__(self, cloud_padded: Array, history: Array, history_valid: Array,
-                 decision_index: Array, num_sources: Array, theta_size: Array) -> tuple[Array, Array]:
+                 decision_index: Array, num_sources: Array, theta_size: Array) -> Array:
         cloud_emb = jax.vmap(
             lambda th: self.theta_embedder(th, num_sources, theta_size)
         )(cloud_padded)
@@ -2551,14 +2357,14 @@ class SeparateDesignPolicy(eqx.Module):
         for block in self.decoder_blocks:
             queries = block(queries, memory, memory_valid)
         queries = _layernorm_tokens(self.final_norm, queries)
-        return _linear_tokens(self.mean_head, queries), _linear_tokens(self.log_std_head, queries)
+        return _linear_tokens(self.logits_head, queries)
 
 
 class JointALINEDesignPolicy(eqx.Module):
     """Integrated ALINE-style design policy using ALL four pretrained Bayes components.
 
     The Bayes observation embedder + causal likelihood Transformer form ALINE's context pathway.
-    The Bayes prior embedder + posterior Transformer form the inference/target pathway. A continuous
+    The Bayes prior embedder + posterior Transformer form the inference/target pathway. A discrete
     acquisition branch then lets learned query tokens attend to both context and target features.
 
     Crucially, ``update_and_propose`` performs the posterior Transformer only once: the same final
@@ -2574,8 +2380,7 @@ class JointALINEDesignPolicy(eqx.Module):
     target_projection: eqx.nn.Linear
     acquisition_blocks: tuple[ALINEAcquisitionBlock, ...]
     final_norm: eqx.nn.LayerNorm
-    mean_head: AcquisitionMLPHead
-    log_std_head: AcquisitionMLPHead
+    logits_head: AcquisitionMLPHead
     empty_context_token: Array
     design_query_tokens: Array
     step_embedding: Array
@@ -2584,7 +2389,6 @@ class JointALINEDesignPolicy(eqx.Module):
     max_history: int = eqx.field(static=True)
     designs_per_step: int = eqx.field(static=True)
     max_source_dim: int = eqx.field(static=True)
-    use_cumulative_observations: bool = eqx.field(static=True)
     fixed_shape_input: bool = eqx.field(static=True)
     joint_aline_mode: bool = eqx.field(static=True)
     uses_reused_prior: bool = eqx.field(static=True)
@@ -2612,7 +2416,6 @@ class JointALINEDesignPolicy(eqx.Module):
         self.max_history = int(cfg.experimental_budget * cfg.designs_per_step)
         self.designs_per_step = int(cfg.designs_per_step)
         self.max_source_dim = int(bt_cfg.max_source_dim)
-        self.use_cumulative_observations = bool(cfg.use_cumulative_observations)
 
         obs_context_dim = int(self.likelihood_embedder.hidden_dim)
         self.context_projection = eqx.nn.Linear(obs_context_dim, self.hidden_dim, key=next(keys))
@@ -2623,12 +2426,8 @@ class JointALINEDesignPolicy(eqx.Module):
             ) for _ in range(cfg.joint_aline_depth)
         )
         self.final_norm = eqx.nn.LayerNorm(self.hidden_dim)
-        self.mean_head = AcquisitionMLPHead(
-            self.hidden_dim, cfg.joint_aline_head_width, self.max_source_dim, key=next(keys)
-        )
-        self.log_std_head = AcquisitionMLPHead(
-            self.hidden_dim, cfg.joint_aline_head_width, self.max_source_dim, key=next(keys),
-            zero_output=True, output_bias=math.log(max(cfg.initial_policy_std, 1e-5)),
+        self.logits_head = AcquisitionMLPHead(
+            self.hidden_dim, cfg.joint_aline_head_width, cfg.grid_size, key=next(keys)
         )
         self.empty_context_token = 0.02 * jax.random.normal(next(keys), (self.hidden_dim,))
         self.design_query_tokens = 0.02 * jax.random.normal(
@@ -2639,14 +2438,8 @@ class JointALINEDesignPolicy(eqx.Module):
             next(keys), (cfg.experimental_budget + 1, self.hidden_dim)
         )
 
-    def _encode_observation_tokens(
-        self, observations: Array, num_sources: Array, theta_size: Array,
-        valid_rows: Array | None = None,
-    ) -> Array:
-        if self.theta_embedder.canonicalize:
-            observations = canonicalize_observation_block_jax(
-                observations, num_sources, theta_size, valid_rows
-            )
+    def _encode_observation_tokens(self, observations: Array, num_sources: Array,
+                                   theta_size: Array) -> Array:
         pair_embeddings = jax.vmap(
             lambda obs: self.observation_embedder(obs, num_sources, theta_size)
         )(observations)
@@ -2656,9 +2449,9 @@ class JointALINEDesignPolicy(eqx.Module):
             return pair_embeddings
         return self.likelihood_embedder(pair_embeddings)
 
-    def _encode_history(
-        self, contexts: Array, history_valid: Array
-    ) -> tuple[Array, Array]:
+    def _encode_history(self, history: Array, history_valid: Array, num_sources: Array,
+                        theta_size: Array) -> tuple[Array, Array]:
+        contexts = self._encode_observation_tokens(history, num_sources, theta_size)
         contexts = jnp.where(history_valid[:, None], contexts, 0.0)
         projected = _linear_tokens(self.context_projection, contexts)
         projected = jnp.where(history_valid[:, None], projected, 0.0)
@@ -2666,55 +2459,31 @@ class JointALINEDesignPolicy(eqx.Module):
         valid = jnp.concatenate([jnp.ones((1,), dtype=bool), history_valid], axis=0)
         return projected, valid
 
-    def _posterior_visible_context_valid(
-        self, context_valid: Array, observation_count: Array
-    ) -> Array:
-        count = jnp.asarray(observation_count, dtype=jnp.int32)
-        positions = jnp.arange(context_valid.shape[0], dtype=jnp.int32)
-        if isinstance(self.posterior_transformer, CrossAttentionPosteriorTransformer):
-            return context_valid & (positions < count)
-        return context_valid & (positions == jnp.maximum(count - 1, 0)) & (count > 0)
-
-    def _acquisition(
-        self, target_hidden: Array, observation_contexts: Array, context_valid: Array,
-        observation_count: Array, decision_index: Array
-    ) -> tuple[Array, Array]:
+    def _acquisition(self, target_hidden: Array, history: Array, history_valid: Array,
+                     decision_index: Array, num_sources: Array, theta_size: Array) -> Array:
         target = _linear_tokens(self.target_projection, target_hidden)
-        context_valid = self._posterior_visible_context_valid(context_valid, observation_count)
-        context, context_valid = self._encode_history(observation_contexts, context_valid)
+        context, context_valid = self._encode_history(
+            history, history_valid, num_sources, theta_size
+        )
         t = jnp.clip(decision_index, 0, self.step_embedding.shape[0] - 1).astype(jnp.int32)
         queries = self.design_query_tokens + self.step_embedding[t][None, :]
         for block in self.acquisition_blocks:
             queries = block(queries, context, context_valid, target)
         queries = _layernorm_tokens(self.final_norm, queries)
-        return self.mean_head(queries), self.log_std_head(queries)
-
+        return self.logits_head(queries)
 
     def __call__(self, cloud_padded: Array, history: Array, history_valid: Array,
-                 decision_index: Array, num_sources: Array, theta_size: Array) -> tuple[Array, Array]:
+                 decision_index: Array, num_sources: Array, theta_size: Array) -> Array:
         """Proposal-only call used for the initial design and auxiliary inference fine-tuning.
 
         During the main joint rollout, all later proposals come from ``update_and_propose`` so the
         posterior cloud and next design set share one posterior-Transformer pass.
         """
-        compact = _policy_compact_cloud(
-            cloud_padded, self.theta_embedder, num_sources, theta_size
-        )
-        canonical_padded = jax.vmap(
-            lambda theta: padded_theta_jax(
-                theta, num_sources, theta_size, cloud_padded.shape[-2], cloud_padded.shape[-1]
-            )
-        )(compact)
         cloud_embeddings = jax.vmap(
             lambda theta: self.theta_embedder(theta, num_sources, theta_size)
-        )(canonical_padded)
-        context_valid = (
-            history_valid if self.use_cumulative_observations else jnp.zeros_like(history_valid)
-        )
-        count = jnp.sum(context_valid.astype(jnp.int32))
-        raw_contexts = self._encode_observation_tokens(
-            history, num_sources, theta_size, context_valid
-        )
+        )(cloud_padded)
+        count = jnp.sum(history_valid.astype(jnp.int32))
+        raw_contexts = self._encode_observation_tokens(history, num_sources, theta_size)
 
         def conditioned(_):
             return posterior_hidden_only(
@@ -2724,7 +2493,7 @@ class JointALINEDesignPolicy(eqx.Module):
             return _linear_tokens(self.posterior_transformer.particle_in, cloud_embeddings)
         target_hidden = jax.lax.cond(count > 0, conditioned, unconditioned, operand=None)
         return self._acquisition(
-            target_hidden, raw_contexts, context_valid, count, decision_index
+            target_hidden, history, history_valid, decision_index, num_sources, theta_size
         )
 
     def update_and_propose(
@@ -2736,31 +2505,18 @@ class JointALINEDesignPolicy(eqx.Module):
         next_decision_index: Array,
         num_sources: Array,
         theta_size: Array,
-    ) -> tuple[Array, Array, Array]:
-        """ONE shared posterior pass -> posterior cloud + next continuous design-set parameters."""
+    ) -> tuple[Array, Array]:
+        """ONE shared posterior pass -> posterior cloud + logits for the next discrete design set."""
         compact = _policy_compact_cloud(
             cloud_padded, self.theta_embedder, num_sources, theta_size
         )
-        canonical_padded = jax.vmap(
-            lambda theta: padded_theta_jax(
-                theta, num_sources, theta_size, cloud_padded.shape[-2], cloud_padded.shape[-1]
-            )
-        )(compact)
         cloud_embeddings = jax.vmap(
             lambda theta: self.theta_embedder(theta, num_sources, theta_size)
-        )(canonical_padded)
-
-        if self.use_cumulative_observations:
-            conditioning_observations = full_history
-            conditioning_valid = history_valid
-        else:
-            conditioning_observations = new_observations
-            conditioning_valid = jnp.ones((new_observations.shape[0],), dtype=bool)
-
+        )(cloud_padded)
         block_contexts = self._encode_observation_tokens(
-            conditioning_observations, num_sources, theta_size, conditioning_valid
+            full_history, num_sources, theta_size
         )
-        count = jnp.sum(conditioning_valid.astype(jnp.int32))
+        count = jnp.sum(history_valid.astype(jnp.int32))
         target_hidden, next_compact = posterior_hidden_and_output(
             self.posterior_transformer,
             cloud_embeddings,
@@ -2773,11 +2529,11 @@ class JointALINEDesignPolicy(eqx.Module):
             next_compact, self.theta_embedder, num_sources, theta_size,
             cloud_padded.shape[-2], cloud_padded.shape[-1],
         )
-        mean_raw, log_std_raw = self._acquisition(
-            target_hidden, block_contexts, conditioning_valid, count, next_decision_index
+        logits_raw = self._acquisition(
+            target_hidden, full_history, history_valid, next_decision_index,
+            num_sources, theta_size,
         )
-        return next_cloud, mean_raw, log_std_raw
-
+        return next_cloud, logits_raw
 
 
 PolicyModule = SeparateDesignPolicy | JointALINEDesignPolicy
@@ -2823,56 +2579,6 @@ def restore_frozen_policy_components(
     return new_policy
 
 
-
-def policy_trainable_filter(
-    policy: PolicyModule,
-    cfg: PolicyConfig,
-):
-    """Boolean pytree selecting exactly the policy arrays optimized by the policy objective.
-
-    Frozen Bayes arrays remain in the forward computation as constants, so pathwise derivatives
-    still propagate THROUGH the pretrained inference map with respect to designs/outcomes.  They are
-    excluded only from parameter differentiation, gradient-norm clipping, AdamW state, and updates.
-    """
-    trainable = jax.tree_util.tree_map(eqx.is_array, policy)
-
-    def freeze_subtree(current_filter, where, subtree):
-        frozen_subtree = jax.tree_util.tree_map(lambda _: False, subtree)
-        return eqx.tree_at(where, current_filter, frozen_subtree)
-
-    if not cfg.train_reused_components_with_policy:
-        if policy.uses_reused_prior:
-            trainable = freeze_subtree(
-                trainable, lambda p: p.theta_embedder, policy.theta_embedder
-            )
-        if policy.uses_reused_likelihood:
-            trainable = freeze_subtree(
-                trainable, lambda p: p.likelihood_embedder, policy.likelihood_embedder
-            )
-        if policy.uses_reused_observation:
-            trainable = freeze_subtree(
-                trainable, lambda p: p.observation_embedder, policy.observation_embedder
-            )
-        if policy.uses_reused_posterior:
-            trainable = freeze_subtree(
-                trainable, lambda p: p.posterior_transformer, policy.posterior_transformer
-            )
-
-    # Preserve the previous policy-embedder rule: fresh heterogeneous embedders may be frozen,
-    # whereas fresh fixed-shape linear input interfaces remain trainable.
-    if not policy.fixed_shape_input and not cfg.train_policy_embedders:
-        if not policy.uses_reused_prior:
-            trainable = freeze_subtree(
-                trainable, lambda p: p.theta_embedder, policy.theta_embedder
-            )
-        if not policy.uses_reused_observation:
-            trainable = freeze_subtree(
-                trainable, lambda p: p.observation_embedder, policy.observation_embedder
-            )
-
-    return trainable
-
-
 def sync_reused_policy_components_from_bayes(
     policy: PolicyModule,
     bayes_model: SequentialBayesModel,
@@ -2909,23 +2615,10 @@ def empirical_energy_score_terms_single(
     return attraction - 0.5 * repulsion, attraction, repulsion
 
 
-def posterior_mean_mse_single(particle_theta: Array, target_theta: Array, theta_size: Array) -> Array:
+def posterior_mean_rmse_single(particle_theta: Array, target_theta: Array, theta_size: Array) -> Array:
     valid = (jnp.arange(particle_theta.shape[-1]) < theta_size).astype(particle_theta.dtype)
     sq = (jnp.mean(particle_theta, axis=0) - target_theta) ** 2
-    return jnp.sum(sq * valid) / jnp.maximum(theta_size, 1)
-
-
-def posterior_mean_rmse_single(particle_theta: Array, target_theta: Array, theta_size: Array) -> Array:
-    return jnp.sqrt(posterior_mean_mse_single(particle_theta, target_theta, theta_size) + 1e-12)
-
-
-def particle_mse_terms_single(
-    particle_theta: Array, target_theta: Array, theta_size: Array
-) -> Array:
-    """Per-particle mean squared error over active theta coordinates."""
-    valid = (jnp.arange(particle_theta.shape[-1]) < theta_size).astype(particle_theta.dtype)
-    sq = (particle_theta - target_theta[None, :]) ** 2
-    return jnp.sum(sq * valid[None, :], axis=-1) / jnp.maximum(theta_size, 1)
+    return jnp.sqrt(jnp.sum(sq * valid) / jnp.maximum(theta_size, 1))
 
 
 def posterior_spread_single(particle_theta: Array, theta_size: Array) -> Array:
@@ -2941,7 +2634,8 @@ def compact_truth_jax(theta_true: Array, num_sources: Array, theta_size: Array, 
 
 
 def compact_cloud_jax(cloud: Array, num_sources: Array, theta_size: Array, cfg: BayesTransportConfig) -> Array:
-    del cfg
+    if cfg.canonicalize_particle_sources:
+        cloud = jax.vmap(lambda th: canonicalize_padded_sources_jax(th, num_sources))(cloud)
     return jax.vmap(lambda th: compact_theta_jax(th, num_sources, theta_size))(cloud)
 
 
@@ -2951,64 +2645,61 @@ def cloud_metrics_jax(
     compact_cloud = compact_cloud_jax(cloud, num_sources, theta_size, cfg)
     compact_truth = compact_truth_jax(theta_true, num_sources, theta_size, cfg)
     es, attraction, repulsion = empirical_energy_score_terms_single(compact_cloud, compact_truth, theta_size)
-    posterior_mean_mse = posterior_mean_mse_single(compact_cloud, compact_truth, theta_size)
-    particle_mse = particle_mse_terms_single(compact_cloud, compact_truth, theta_size)
-    particle_mean_mse = jnp.mean(particle_mse)
     return {
         "energy_score": es,
         "attraction": attraction,
         "repulsion": repulsion,
-        "rmse": jnp.sqrt(posterior_mean_mse + 1e-12),
-        "posterior_mean_mse": posterior_mean_mse,
-        "posterior_mean_rmse": jnp.sqrt(posterior_mean_mse + 1e-12),
-        "particle_mean_mse": particle_mean_mse,
-        "particle_max_mse": jnp.max(particle_mse),
-        "particle_median_mse": jnp.median(particle_mse),
-        "mean_log_mse": jnp.mean(jnp.log(particle_mse + 1e-12)),
-        "log_mean_mse": jnp.log(particle_mean_mse + 1e-12),
+        "rmse": posterior_mean_rmse_single(compact_cloud, compact_truth, theta_size),
         "spread": posterior_spread_single(compact_cloud, theta_size),
     }
 
 
-def reward_from_metrics(
-    initial: dict[str, Array],
-    before: dict[str, Array],
-    after: dict[str, Array],
-    decision_index: Array,
-    cfg: PolicyConfig,
-) -> Array:
-    """Reward from the configured posterior loss and temporal reference.
-
-    Every supported reward_mode is a loss to MINIMIZE.  For terminal reference, all intermediate
-    rewards are exactly zero and the final reward is the negative final loss.
-    """
-    metric_name = cfg.reward_mode
-    if cfg.reward_reference == "terminal":
-        is_terminal = decision_index == (cfg.experimental_budget - 1)
-        reward = jnp.where(
-            is_terminal,
-            -after[metric_name],
-            jnp.asarray(0.0, dtype=after[metric_name].dtype),
-        )
+def reward_from_metrics(before: dict[str, Array], after: dict[str, Array], cfg: PolicyConfig) -> Array:
+    # Lower attraction / lower full energy score means greater certainty near the true theta*.
+    if cfg.reward_mode == "attraction":
+        reward = before["attraction"] - after["attraction"]
     else:
-        reference = initial if cfg.reward_reference == "initial" else before
-        reward = reference[metric_name] - after[metric_name]
-
+        reward = before["energy_score"] - after["energy_score"]
     reward = cfg.reward_scale * reward
     if cfg.reward_clip is not None:
         reward = jnp.clip(reward, -float(cfg.reward_clip), float(cfg.reward_clip))
     return reward
 
 
-#%% 8) Bounded Tanh-Gaussian policy sampling and multi-observation Bayes updates
+#%% 8) Discrete ALINE-style policy sampling and multi-observation Bayes updates
 def _active_design_mask(theta_size: Array, num_sources: Array, max_source_dim: int) -> Array:
     source_dim = theta_size // num_sources
     return jnp.arange(max_source_dim) < source_dim
 
 
-def sample_design_set_from_raw(
-    mean_raw: Array,
-    log_std_raw: Array,
+def make_discrete_design_pool_np(
+    bt_cfg: BayesTransportConfig, cfg: PolicyConfig
+) -> np.ndarray:
+    """Fixed stratified query pool spanning the bounded design box.
+
+    ALINE uses a finite candidate query set and the policy head returns a probability distribution
+    over those candidates.  ``grid_size`` is kept at its existing value and is reused as the number
+    of full-vector candidate designs.  A deterministic Latin-hypercube-style stratification gives
+    good box coverage without the exponential cost of a Cartesian grid in higher dimensions.
+    """
+    n = int(cfg.grid_size)
+    d = int(bt_cfg.max_source_dim)
+    rng = np.random.default_rng(int(cfg.seed) + 91_733)
+    strata = (np.arange(n, dtype=np.float64) + 0.5) / float(n)
+    unit = np.empty((n, d), dtype=np.float64)
+    for axis in range(d):
+        unit[:, axis] = strata[rng.permutation(n)]
+    pool = float(bt_cfg.design_low) + (float(bt_cfg.design_high) - float(bt_cfg.design_low)) * unit
+    return pool.astype(np.float32)
+
+
+def _categorical_policy_temperature(cfg: PolicyConfig) -> float:
+    """Reuse the existing policy-scale knobs as a fixed categorical-logit temperature."""
+    return float(np.clip(cfg.initial_policy_std, cfg.min_policy_std, cfg.max_policy_std))
+
+
+def sample_design_set_from_logits(
+    logits_raw: Array,
     key: Array,
     num_sources: Array,
     theta_size: Array,
@@ -3017,49 +2708,78 @@ def sample_design_set_from_raw(
     *,
     deterministic: bool,
 ) -> tuple[Array, Array, Array, Array, Array]:
-    """Sample the bounded continuous design set from already-computed policy parameters."""
-    log_std = jnp.clip(log_std_raw, math.log(cfg.min_policy_std), math.log(cfg.max_policy_std))
-    std = jnp.exp(log_std)
-    eps = jax.random.normal(key, mean_raw.shape)
-    latent = mean_raw if deterministic else mean_raw + std * eps
+    """Sample K full design vectors from the discrete policy logits.
 
-    if cfg.gradient_estimator == "reinforce" and not deterministic:
-        latent_for_env = jax.lax.stop_gradient(latent)
-    else:
-        latent_for_env = latent
-
-    unit = jnp.tanh(latent_for_env)
-    center = 0.5 * (bt_cfg.design_low + bt_cfg.design_high)
-    half_range = 0.5 * (bt_cfg.design_high - bt_cfg.design_low)
-    designs = center + half_range * unit
-
+    The policy emits one categorical logit vector per jointly proposed design. Candidates are sampled
+    without replacement within the K-set. REINFORCE uses the exact categorical score-function log
+    probability; the optional pathwise mode uses a straight-through Gumbel-Softmax relaxation while
+    executing an exact candidate point in the forward simulator.
+    """
+    pool = jnp.asarray(make_discrete_design_pool_np(bt_cfg, cfg), dtype=logits_raw.dtype)
     active = _active_design_mask(theta_size, num_sources, bt_cfg.max_source_dim)
-    designs = jnp.where(active[None, :], designs, 0.0)
-    mean_design = center + half_range * jnp.tanh(mean_raw)
-    mean_design = jnp.where(active[None, :], mean_design, 0.0)
+    pool = jnp.where(active[None, :], pool, 0.0)
 
-    if deterministic:
-        joint_log_prob = jnp.asarray(0.0, dtype=designs.dtype)
-    else:
-        latent_lp_arg = jax.lax.stop_gradient(latent) if cfg.gradient_estimator == "reinforce" else latent
-        unit_lp_arg = (
-            jax.lax.stop_gradient(jnp.tanh(latent))
-            if cfg.gradient_estimator == "reinforce" else jnp.tanh(latent)
-        )
-        base_log_prob = (
-            -0.5 * ((latent_lp_arg - mean_raw) / std) ** 2
-            - log_std - 0.5 * math.log(2.0 * math.pi)
-        )
-        tanh_correction = -jnp.log(1.0 - unit_lp_arg**2 + 1e-6)
-        joint_log_prob = jnp.sum((base_log_prob + tanh_correction) * active[None, :])
+    temperature = jnp.asarray(_categorical_policy_temperature(cfg), dtype=logits_raw.dtype)
+    logits = logits_raw / temperature
+    probs = jax.nn.softmax(logits, axis=-1)
+    mean_designs = probs @ pool
 
-    latent_entropy = jnp.sum(
-        (log_std + 0.5 * math.log(2.0 * math.pi * math.e)) * active[None, :]
+    # Keep the existing ``mean_policy_std`` diagnostic meaningful: it is now the expected RMS
+    # physical dispersion of the categorical design distribution around its mean design.
+    deviations = pool[None, :, :] - mean_designs[:, None, :]
+    variances = jnp.sum(probs[:, :, None] * deviations**2, axis=1)
+    active_float = active.astype(logits_raw.dtype)
+    rms_std = jnp.sqrt(
+        jnp.sum(variances * active_float[None, :], axis=-1)
+        / jnp.maximum(jnp.sum(active_float), 1.0)
+        + 1e-12
     )
-    mean_std = jnp.sum(std * active[None, :]) / jnp.maximum(
-        jnp.sum(active) * cfg.designs_per_step, 1
+    mean_std = jnp.mean(rms_std)
+
+    sample_keys = jax.random.split(key, cfg.designs_per_step)
+    initial_available = jnp.ones((cfg.grid_size,), dtype=bool)
+    candidate_ids = jnp.arange(cfg.grid_size, dtype=jnp.int32)
+
+    def choose_one(available, inputs):
+        logits_k, sample_key = inputs
+        masked_logits = jnp.where(available, logits_k, jnp.asarray(-1e9, dtype=logits_k.dtype))
+        log_probs_k = jax.nn.log_softmax(masked_logits)
+        probs_k = jax.nn.softmax(masked_logits)
+
+        if deterministic:
+            index = jnp.argmax(masked_logits).astype(jnp.int32)
+            weights = jax.nn.one_hot(index, cfg.grid_size, dtype=logits_k.dtype)
+            log_prob_k = jnp.asarray(0.0, dtype=logits_k.dtype)
+        elif cfg.gradient_estimator == "reinforce":
+            index = jax.random.categorical(sample_key, masked_logits).astype(jnp.int32)
+            weights = jax.nn.one_hot(index, cfg.grid_size, dtype=logits_k.dtype)
+            log_prob_k = log_probs_k[index]
+        else:
+            # Straight-through Gumbel-Softmax: exact discrete candidate forward, soft gradient back.
+            uniform = jax.random.uniform(
+                sample_key, masked_logits.shape, minval=1e-6, maxval=1.0 - 1e-6
+            )
+            gumbel = -jnp.log(-jnp.log(uniform))
+            soft_weights = jax.nn.softmax(masked_logits + gumbel)
+            index = jnp.argmax(soft_weights).astype(jnp.int32)
+            hard_weights = jax.nn.one_hot(index, cfg.grid_size, dtype=logits_k.dtype)
+            weights = jax.lax.stop_gradient(hard_weights - soft_weights) + soft_weights
+            log_prob_k = log_probs_k[index]
+
+        design = weights @ pool
+        entropy_k = -jnp.sum(probs_k * log_probs_k)
+        available = available & (candidate_ids != index)
+        return available, (design, log_prob_k, entropy_k)
+
+    _, (designs, log_probs, entropies) = jax.lax.scan(
+        choose_one, initial_available, (logits, sample_keys)
     )
-    return designs, joint_log_prob, latent_entropy, mean_design, mean_std
+    if cfg.gradient_estimator == "reinforce" and not deterministic:
+        designs = jax.lax.stop_gradient(designs)
+
+    joint_log_prob = jnp.sum(log_probs)
+    categorical_entropy = jnp.sum(entropies)
+    return designs, joint_log_prob, categorical_entropy, mean_designs, mean_std
 
 
 def sample_policy_design_set(
@@ -3076,23 +2796,23 @@ def sample_policy_design_set(
     *,
     deterministic: bool,
 ) -> tuple[Array, Array, Array, Array, Array]:
-    """Compute policy parameters from the configured belief/context state, then sample K bounded designs."""
-    mean_raw, log_std_raw = policy(
+    """Compute logits from the ENTIRE history, then sample K designs from the discrete query pool."""
+    logits_raw = policy(
         cloud, history, history_valid, decision_index, num_sources, theta_size
     )
-    return sample_design_set_from_raw(
-        mean_raw, log_std_raw, key, num_sources, theta_size, bt_cfg, cfg,
+    return sample_design_set_from_logits(
+        logits_raw, key, num_sources, theta_size, bt_cfg, cfg,
         deterministic=deterministic,
     )
+
 
 def _bayes_update_observation_block(
     bayes_model: SequentialBayesModel,
     cloud_padded: Array,
     observations: Array,
-    observation_count: Array | int,
+    observation_count: int,
     num_sources: Array,
     theta_size: Array,
-    valid_rows: Array | None = None,
 ) -> Array:
     """Apply ONE Bayes-map update using an observation block.
 
@@ -3102,16 +2822,13 @@ def _bayes_update_observation_block(
     with ``observation_count``.  Consequently, for a checkpoint trained with O>1 observations per
     Bayes update, a set of K observations is *not* silently converted into K separate posterior maps.
     """
-    if isinstance(observation_count, (int, np.integer)):
-        if int(observation_count) < 1:
-            raise ValueError("observation_count must be >= 1.")
-        if observations.shape[0] < int(observation_count):
-            raise ValueError("Observation block is shorter than observation_count.")
+    if observation_count < 1:
+        raise ValueError("observation_count must be >= 1.")
+    if observations.shape[0] < observation_count:
+        raise ValueError("Observation block is shorter than observation_count.")
 
     compact = bayes_model._compact_reference_cloud(cloud_padded, num_sources, theta_size)
-    contexts = bayes_model._encode_observation_block(
-        observations, num_sources, theta_size, valid_rows
-    )
+    contexts = bayes_model._encode_observation_block(observations, num_sources, theta_size)
     next_compact = bayes_model._transport_compact_with_contexts(
         compact,
         contexts,
@@ -3166,29 +2883,6 @@ def bayes_update_observation_set(
     # contextualised jointly and only the K-prefix posterior is returned.
     return _bayes_update_observation_block(
         bayes_model, cloud_padded, observations, K, num_sources, theta_size
-    )
-
-
-def bayes_update_policy_state(
-    bayes_model: SequentialBayesModel,
-    base_prior_padded: Array,
-    current_cloud_padded: Array,
-    new_observations: Array,
-    full_history: Array,
-    history_valid: Array,
-    num_sources: Array,
-    theta_size: Array,
-    cfg: PolicyConfig,
-) -> Array:
-    """Apply the configured cumulative-prefix or repeated-Bayes posterior update."""
-    if cfg.use_cumulative_observations:
-        count = jnp.sum(history_valid.astype(jnp.int32))
-        return _bayes_update_observation_block(
-            bayes_model, base_prior_padded, full_history, count, num_sources, theta_size,
-            valid_rows=history_valid,
-        )
-    return bayes_update_observation_set(
-        bayes_model, current_cloud_padded, new_observations, num_sources, theta_size
     )
 
 
@@ -3283,23 +2977,23 @@ def rollout_episode_joint_aline(
     Decision 0 is bootstrapped from the prior/current belief.  Thereafter each call to
     ``update_and_propose`` simultaneously produces the posterior cloud after the newly acquired
     observation block AND the distribution of the next design set, using one posterior-Transformer
-    pass.  Posterior and acquisition share the same configured cumulative-history or new-block context.
+    pass.  The full accumulated design/outcome history is always supplied to the acquisition head.
     """
     H = cfg.experimental_budget * cfg.designs_per_step
     history0 = jnp.zeros((H, bt_cfg.max_source_dim + 1), dtype=prior_particles.dtype)
     valid0 = jnp.zeros((H,), dtype=bool)
-    mean0, log_std0 = policy(
+    logits0 = policy(
         prior_particles, history0, valid0, jnp.asarray(0, dtype=jnp.int32),
         num_sources, theta_size,
     )
 
     def decision_step(carry, t):
-        cloud, history, history_valid, rng_key, mean_raw, log_std_raw = carry
+        cloud, history, history_valid, rng_key, logits_raw = carry
         rng_key, action_key, outcome_key = jax.random.split(rng_key, 3)
         before = cloud_metrics_jax(cloud, theta_true, num_sources, theta_size, bt_cfg)
 
-        designs, log_prob, entropy, mean_designs, mean_std = sample_design_set_from_raw(
-            mean_raw, log_std_raw, action_key, num_sources, theta_size, bt_cfg, cfg,
+        designs, log_prob, entropy, mean_designs, mean_std = sample_design_set_from_logits(
+            logits_raw, action_key, num_sources, theta_size, bt_cfg, cfg,
             deterministic=deterministic,
         )
         means = source_log_mean_jax(theta_true, designs, num_sources, theta_size, bt_cfg)
@@ -3323,12 +3017,11 @@ def rollout_episode_joint_aline(
 
         # Shared inference/acquisition call: SAME posterior hidden particles feed the physical
         # posterior head and the ALINE-style acquisition head for decision t+1.
-        bayes_input_cloud = prior_particles if cfg.use_cumulative_observations else cloud
-        cloud, next_mean_raw, next_log_std_raw = policy.update_and_propose(
-            bayes_input_cloud, observations, history, history_valid, t + 1, num_sources, theta_size
+        cloud, next_logits_raw = policy.update_and_propose(
+            cloud, observations, history, history_valid, t + 1, num_sources, theta_size
         )
         after = cloud_metrics_jax(cloud, theta_true, num_sources, theta_size, bt_cfg)
-        reward = reward_from_metrics(initial_metrics, before, after, t, cfg)
+        reward = reward_from_metrics(before, after, cfg)
         if cfg.gradient_estimator == "reinforce":
             reward = jax.lax.stop_gradient(reward)
 
@@ -3350,15 +3043,15 @@ def rollout_episode_joint_aline(
             "spread": after["spread"],
         }
         return (
-            cloud, history, history_valid, rng_key, next_mean_raw, next_log_std_raw
+            cloud, history, history_valid, rng_key, next_logits_raw
         ), outputs
 
     initial_metrics = cloud_metrics_jax(
         prior_particles, theta_true, num_sources, theta_size, bt_cfg
     )
-    (_, _, _, _, _, _), trajectory = jax.lax.scan(
+    (_, _, _, _, _), trajectory = jax.lax.scan(
         decision_step,
-        (prior_particles, history0, valid0, key, mean0, log_std0),
+        (prior_particles, history0, valid0, key, logits0),
         jnp.arange(cfg.experimental_budget, dtype=jnp.int32),
     )
     trajectory["initial_energy_score"] = initial_metrics["energy_score"]
@@ -3409,13 +3102,11 @@ def rollout_episode(
                 action_key, bt_cfg, cfg, deterministic=deterministic,
             )
         elif policy_kind == "random":
-            source_dim = theta_size // num_sources
-            active = jnp.arange(bt_cfg.max_source_dim) < source_dim
-            raw = jax.random.uniform(
-                action_key, (cfg.designs_per_step, bt_cfg.max_source_dim),
-                minval=bt_cfg.design_low, maxval=bt_cfg.design_high,
-            )
-            designs = jnp.where(active[None, :], raw, 0.0)
+            active = _active_design_mask(theta_size, num_sources, bt_cfg.max_source_dim)
+            pool = jnp.asarray(make_discrete_design_pool_np(bt_cfg, cfg), dtype=cloud.dtype)
+            pool = jnp.where(active[None, :], pool, 0.0)
+            indices = jax.random.permutation(action_key, cfg.grid_size)[:cfg.designs_per_step]
+            designs = pool[indices]
             mean_designs = designs
             log_prob = jnp.asarray(0.0, dtype=cloud.dtype)
             entropy = jnp.asarray(0.0, dtype=cloud.dtype)
@@ -3434,25 +3125,24 @@ def rollout_episode(
         observations = observations.at[:, :bt_cfg.max_source_dim].set(designs)
         observations = observations.at[:, -1].set(outcomes)
 
+        # K designs are proposed as a set from the SAME pre-step belief/history.  A pretrained
+        # multi-observation Bayes map must see that set jointly: its causal likelihood Transformer
+        # builds the K-prefix context before the posterior transport is applied.  Only checkpoints
+        # that were strictly single-observation fall back to recurrent K x one-observation updates.
+        cloud = bayes_update_observation_set(
+            bayes_model, cloud, observations, num_sources, theta_size
+        )
+        after = cloud_metrics_jax(cloud, theta_true, num_sources, theta_size, bt_cfg)
+        reward = reward_from_metrics(before, after, cfg)
+        if cfg.gradient_estimator == "reinforce":
+            # Pure score-function estimator: rewards/environment are data, not pathwise gradients.
+            reward = jax.lax.stop_gradient(reward)
+
         start = t * cfg.designs_per_step
         history = jax.lax.dynamic_update_slice(history, observations, (start, 0))
         history_valid = jax.lax.dynamic_update_slice(
             history_valid, jnp.ones((cfg.designs_per_step,), dtype=bool), (start,)
         )
-
-        # K designs are proposed as a set from the SAME pre-step belief/history.  A pretrained
-        # multi-observation Bayes map must see that set jointly: its causal likelihood Transformer
-        # builds the K-prefix context before the posterior transport is applied.  Only checkpoints
-        # that were strictly single-observation fall back to recurrent K x one-observation updates.
-        cloud = bayes_update_policy_state(
-            bayes_model, prior_particles, cloud, observations, history, history_valid,
-            num_sources, theta_size, cfg
-        )
-        after = cloud_metrics_jax(cloud, theta_true, num_sources, theta_size, bt_cfg)
-        reward = reward_from_metrics(initial_metrics, before, after, t, cfg)
-        if cfg.gradient_estimator == "reinforce":
-            # Pure score-function estimator: rewards/environment are data, not pathwise gradients.
-            reward = jax.lax.stop_gradient(reward)
 
         diversity = design_set_diversity_penalty(mean_designs, theta_size, num_sources, cfg)
         outputs = {
@@ -3541,10 +3231,10 @@ def policy_batch_objective(
     discounts = cfg.discount_gamma ** jnp.arange(cfg.experimental_budget, dtype=rewards.dtype)
 
     if cfg.gradient_estimator == "pathwise":
-        # Mohamed et al. Eq. 29: all simulator randomness has been expressed through parameter-
-        # independent base noise, so ordinary autodiff through the sampled trajectory estimates
-        # d/dpsi E[R].  "initial" gives direct prefix losses; "previous" gives incremental
-        # improvements; "terminal" contributes only -loss(C_T) at the final step.
+        # The discrete action is relaxed with straight-through Gumbel-Softmax, so the forward pass
+        # executes an exact candidate design while autodiff follows the corresponding soft sample.
+        # With gamma=1 and improvement rewards, the reward sum still telescopes toward total
+        # reduction in the selected uncertainty score.
         objective = jnp.mean(jnp.sum(discounts[None, :] * rewards, axis=-1))
         policy_loss = -objective
         signal_for_baseline = rewards
@@ -3636,16 +3326,15 @@ def bayes_finetune_batch_objective(
             observations = observations.at[:, :bt_cfg.max_source_dim].set(designs)
             observations = observations.at[:, -1].set(outcomes)
 
+            cloud = bayes_update_observation_set(
+                bayes_model, cloud, observations, num_sources, theta_size
+            )
+            metrics = cloud_metrics_jax(cloud, theta_true, num_sources, theta_size, bt_cfg)
             start = t * cfg.designs_per_step
             history = jax.lax.dynamic_update_slice(history, observations, (start, 0))
             history_valid = jax.lax.dynamic_update_slice(
                 history_valid, jnp.ones((cfg.designs_per_step,), dtype=bool), (start,)
             )
-            cloud = bayes_update_policy_state(
-                bayes_model, prior, cloud, observations, history, history_valid,
-                num_sources, theta_size, cfg
-            )
-            metrics = cloud_metrics_jax(cloud, theta_true, num_sources, theta_size, bt_cfg)
             return (cloud, history, history_valid, key), metrics["energy_score"]
 
         (_, _, _, _), energy_by_t = jax.lax.scan(
@@ -3714,6 +3403,8 @@ def posterior_cloud_host_metrics(
     logdet_values, coverage_values = [], []
     for cloud in np.asarray(clouds):
         active = cloud[:, :S, :D]
+        if bt_cfg.canonicalize_particle_sources and S > 1:
+            active = np.stack([canonicalize_sources_np(x) for x in active], axis=0)
         x = active.reshape(active.shape[0], Kdim)
         covariance = np.cov(x, rowvar=False)
         covariance = np.atleast_2d(covariance) + 1e-6 * np.eye(Kdim)
@@ -3775,13 +3466,13 @@ def evaluate_policy_pair(
             collector["cov_logdet"].append(extra["cov_logdet"])
             collector["coverage"].append(extra["coverage"])
         if b < n_eig:
-            spce_rng = np.random.default_rng(evaluation_seed(cfg) + 90_000 + b)
+            spce_rng = np.random.default_rng(cfg.seed + 90_000 + b)
             # Re-seed identically for paired contrastive theta samples.
             spce_learned.append(estimate_spce_curve_np(
                 eval_batch_np["theta_true"][b], learned_np["observations"][b], S, size,
                 spce_rng, bt_cfg, cfg,
             ))
-            spce_rng = np.random.default_rng(evaluation_seed(cfg) + 90_000 + b)
+            spce_rng = np.random.default_rng(cfg.seed + 90_000 + b)
             spce_random.append(estimate_spce_curve_np(
                 eval_batch_np["theta_true"][b], random_np["observations"][b], S, size,
                 spce_rng, bt_cfg, cfg,
@@ -4066,8 +3757,10 @@ def select_prefixes(trajectory_length: int, n_panels_after_prior: int = 5) -> li
 
 
 def _active_cloud_np(cloud_padded: np.ndarray, S: int, D: int, cfg: BayesTransportConfig) -> np.ndarray:
-    del cfg
-    return np.asarray(cloud_padded)[:, :S, :D]
+    active = np.asarray(cloud_padded)[:, :S, :D]
+    if cfg.canonicalize_particle_sources and S > 1:
+        active = np.stack([canonicalize_sources_np(x) for x in active], axis=0)
+    return active
 
 
 def plot_fixed_policy_evolution(
@@ -4197,7 +3890,7 @@ def _choose_policy_fixed_diagnostic_shape(
     # return tuple(two_d[0] if two_d else shapes[0])
 
     shapes = policy_shape_pool(bt_cfg, cfg)
-    preferred_shape = (2, 2)
+    preferred_shape = (3, 2)
     if preferred_shape not in shapes:
         raise ValueError(
             f"Requested visualization shape {preferred_shape} is not available "
@@ -4241,27 +3934,14 @@ def make_or_load_policy_fixed_reference(
     baseline and Gaussian observation-noise realization, without depending on the shape or horizon of
     the old Bayes-Transport diagnostic.
     """
-    eval_seed = evaluation_seed(cfg)
-    if cfg.train_policy:
-        policy_path = policy_run_dir / "artefacts" / "policy_fixed_reference.npz"
-    else:
-        policy_path = (
-            policy_run_dir
-            / cfg.evaluation_output_subdir
-            / f"seed_{eval_seed}"
-            / "artefacts"
-            / "policy_fixed_reference.npz"
-        )
-        policy_path.parent.mkdir(parents=True, exist_ok=True)
-
+    policy_path = policy_run_dir / "artefacts" / "policy_fixed_reference.npz"
     _describe_original_bayes_fixed_trajectory(bt_cfg, cfg)
 
     if policy_path.is_file():
         data = dict(np.load(policy_path, allow_pickle=False))
         print(
             "Policy fixed diagnostic: reusing saved downstream example "
-            f"{policy_path} with evaluation seed={eval_seed}, "
-            f"(S={int(data['num_sources'])}, "
+            f"{policy_path} with (S={int(data['num_sources'])}, "
             f"D={int(data['theta_size']) // int(data['num_sources'])})."
         )
         return {name: np.asarray(value) for name, value in data.items()}
@@ -4276,10 +3956,9 @@ def make_or_load_policy_fixed_reference(
     # Distinct deterministic seeds make this genuinely policy-specific rather than silently
     # reproducing the Bayes diagnostic. The same sampled epsilon is used by strategic and random
     # policies so the fixed comparison is paired.
-    reference_seed = cfg.seed if cfg.train_policy else eval_seed
-    truth_rng = np.random.default_rng(reference_seed + 25_000)
-    prior_rng = np.random.default_rng(reference_seed + 26_000)
-    experiment_rng = np.random.default_rng(reference_seed + 27_000)
+    truth_rng = np.random.default_rng(cfg.seed + 25_000)
+    prior_rng = np.random.default_rng(cfg.seed + 26_000)
+    experiment_rng = np.random.default_rng(cfg.seed + 27_000)
 
     theta_active = sample_base_prior_np(
         truth_rng, 1, bt_cfg, num_sources=S, source_dim=D
@@ -4296,9 +3975,11 @@ def make_or_load_policy_fixed_reference(
 
     T = int(cfg.experimental_budget)
     K = int(cfg.designs_per_step)
-    random_designs = experiment_rng.uniform(
-        bt_cfg.design_low, bt_cfg.design_high, size=(T, K, D)
-    ).astype(np.float32)
+    discrete_pool = make_discrete_design_pool_np(bt_cfg, cfg)[:, :D]
+    random_indices = np.stack(
+        [experiment_rng.choice(cfg.grid_size, size=K, replace=False) for _ in range(T)], axis=0
+    )
+    random_designs = discrete_pool[random_indices].astype(np.float32)
     eps = experiment_rng.normal(size=(T, K)).astype(np.float32)
     random_mean = source_log_mean_np(theta_active, random_designs, bt_cfg).astype(np.float32)
     random_outcomes = random_mean + np.float32(bt_cfg.observation_noise_std) * eps
@@ -4333,22 +4014,12 @@ def rollout_prescribed_observations(
     generated once for this downstream policy run and then held constant across all epochs.
     """
     initial_metrics = cloud_metrics_jax(prior_particles, theta_true, num_sources, theta_size, bt_cfg)
-    H = cfg.experimental_budget * cfg.designs_per_step
-    history0 = jnp.zeros((H, bt_cfg.max_source_dim + 1), dtype=prior_particles.dtype)
-    valid0 = jnp.zeros((H,), dtype=bool)
 
-    def decision_step(carry, inputs):
-        cloud, history, history_valid = carry
-        t, obs_block = inputs
+    def decision_step(cloud, obs_block):
         before = cloud_metrics_jax(cloud, theta_true, num_sources, theta_size, bt_cfg)
-        start = t * cfg.designs_per_step
-        history = jax.lax.dynamic_update_slice(history, obs_block, (start, 0))
-        history_valid = jax.lax.dynamic_update_slice(
-            history_valid, jnp.ones((cfg.designs_per_step,), dtype=bool), (start,)
-        )
-        cloud = bayes_update_policy_state(
-            bayes_model, prior_particles, cloud, obs_block, history, history_valid,
-            num_sources, theta_size, cfg
+
+        cloud = bayes_update_observation_set(
+            bayes_model, cloud, obs_block, num_sources, theta_size
         )
         after = cloud_metrics_jax(cloud, theta_true, num_sources, theta_size, bt_cfg)
         output = {
@@ -4356,7 +4027,7 @@ def rollout_prescribed_observations(
             "designs": obs_block[:, :bt_cfg.max_source_dim],
             "outcomes": obs_block[:, -1],
             "observations": obs_block,
-            "reward": reward_from_metrics(initial_metrics, before, after, t, cfg),
+            "reward": reward_from_metrics(before, after, cfg),
             "log_prob": jnp.asarray(0.0, dtype=cloud.dtype),
             "entropy": jnp.asarray(0.0, dtype=cloud.dtype),
             "mean_std": jnp.asarray(0.0, dtype=cloud.dtype),
@@ -4367,13 +4038,9 @@ def rollout_prescribed_observations(
             "rmse": after["rmse"],
             "spread": after["spread"],
         }
-        return (cloud, history, history_valid), output
+        return cloud, output
 
-    (_, _, _), trajectory = jax.lax.scan(
-        decision_step,
-        (prior_particles, history0, valid0),
-        (jnp.arange(cfg.experimental_budget, dtype=jnp.int32), observations),
-    )
+    _, trajectory = jax.lax.scan(decision_step, prior_particles, observations)
     trajectory["initial_energy_score"] = initial_metrics["energy_score"]
     trajectory["initial_attraction"] = initial_metrics["attraction"]
     trajectory["initial_rmse"] = initial_metrics["rmse"]
@@ -4388,7 +4055,7 @@ def fixed_policy_pair_rollout(
     truth = jnp.asarray(fixed["theta_true"]); prior = jnp.asarray(fixed["prior_particles"])
     S = jnp.asarray(fixed["num_sources"]); size = jnp.asarray(fixed["theta_size"])
     eps = jnp.asarray(fixed["observation_noise"])
-    key = jax.random.key(evaluation_seed(cfg) + 31_000)
+    key = jax.random.key(cfg.seed + 31_000)
     learned = rollout_episode(
         policy, bayes_model, truth, prior, S, size, key, bt_cfg, cfg,
         policy_kind="learned", deterministic=True, fixed_observation_noise=eps,
@@ -4399,30 +4066,6 @@ def fixed_policy_pair_rollout(
     )
     to_np = lambda tree: jax.tree_util.tree_map(lambda x: np.asarray(jax.device_get(x)), tree)
     return to_np(learned), to_np(random)
-
-
-
-def resolve_policy_reload_dir(cfg: PolicyConfig) -> Path:
-    """Resolve a completed policy run for evaluation-only execution.
-
-    An explicit policy_reload_dir wins.  Otherwise an archived copy of this script may be executed
-    directly from its saved policy-run directory, detected by artefacts/policy_last.eqx.
-    """
-    if cfg.policy_reload_dir is not None:
-        path = Path(cfg.policy_reload_dir).expanduser().resolve()
-        if not path.is_dir():
-            raise FileNotFoundError(f"Configured policy_reload_dir does not exist: {path}")
-        return path
-
-    if "__file__" in globals():
-        script_dir = Path(__file__).expanduser().resolve().parent
-        if (script_dir / "artefacts" / "policy_last.eqx").is_file():
-            return script_dir
-
-    raise ValueError(
-        "train_policy=False requires either POLICY_CFG.policy_reload_dir to point to the completed "
-        "policy run, or execution of the archived script copy stored inside that run directory."
-    )
 
 
 #%% 15) Create/reload policy run and instantiate both models
@@ -4443,19 +4086,13 @@ print("Recovered Bayes-Transport compatibility configuration:\n", yaml.safe_dump
 print("Bayes observation handling:", BAYES_OBSERVATION_COMPATIBILITY)
 if joint_aline_mode(POLICY_CFG):
     max_context_observations = POLICY_CFG.experimental_budget * POLICY_CFG.designs_per_step
-    if POLICY_CFG.use_cumulative_observations:
-        print(
-            "Joint ALINE context: posterior and acquisition share the ENTIRE accumulated design-outcome "
-            f"history, up to {max_context_observations} observations per episode. "
-            f"The pretrained likelihood path saw prefixes {BT_CFG.min_observations_per_step}.."
-            f"{BT_CFG.max_observations_per_step}; longer downstream histories are allowed as "
-            "sequence-length extrapolation and may be adapted when finetune_bayes_transport=True."
-        )
-    else:
-        print(
-            "Joint ALINE context: repeated-Bayes mode uses only the newly acquired observation block "
-            "at each posterior/acquisition update; previous information is carried by the current cloud."
-        )
+    print(
+        "Joint ALINE context: acquisition always consumes the ENTIRE accumulated design-outcome "
+        f"history, up to {max_context_observations} observations per episode. "
+        f"The pretrained likelihood path saw prefixes {BT_CFG.min_observations_per_step}.."
+        f"{BT_CFG.max_observations_per_step}; longer downstream histories are allowed as "
+        "sequence-length extrapolation and may be adapted when finetune_bayes_transport=True."
+    )
 print("Archived Bayes-Transport source:", BAYES_SOURCE_SCRIPT)
 
 BAYES_CHECKPOINT = find_bayes_checkpoint(POLICY_CFG)
@@ -4471,7 +4108,9 @@ if POLICY_CFG.train_policy:
     print("Policy run directory:", policy_run_dir)
     print("Archived policy script:", archived_policy_script)
 else:
-    policy_run_dir = resolve_policy_reload_dir(POLICY_CFG)
+    if POLICY_CFG.policy_reload_dir is None:
+        raise ValueError("Set policy_reload_dir when train_policy=False.")
+    policy_run_dir = Path(POLICY_CFG.policy_reload_dir).expanduser().resolve()
     for child in ("plots","artefacts","tables"):
         (policy_run_dir / child).mkdir(parents=True, exist_ok=True)
     print("Reloading policy run:", policy_run_dir)
@@ -4533,43 +4172,31 @@ fixed_reference = make_or_load_policy_fixed_reference(BT_CFG, POLICY_CFG, policy
 # Fixed evaluation set is generated ONCE and kept unchanged throughout training, just like the
 # original Bayes-Transport validation diagnostics.  Random/strategic evaluation shares the same
 # theta*, prior clouds and JAX episode keys for paired comparisons.
-EVAL_SEED = evaluation_seed(POLICY_CFG)
-print("Evaluation seed:", EVAL_SEED)
-eval_rng = np.random.default_rng(EVAL_SEED + 20_000)
+eval_rng = np.random.default_rng(POLICY_CFG.seed + 20_000)
 eval_batch_np = make_policy_batch_np(
     eval_rng, POLICY_CFG.n_eval_trajectories, BT_CFG, POLICY_CFG, balanced_shapes=True
 )
 
 
 #%% 16) Optimizers and jitted train steps
-# Evaluation-only execution deliberately allocates no optimizer state and performs no training.
-if POLICY_CFG.train_policy:
-    policy_optimizer = optax.chain(
-        optax.clip_by_global_norm(POLICY_CFG.grad_clip_norm),
-        optax.adamw(POLICY_CFG.learning_rate, weight_decay=POLICY_CFG.weight_decay),
-    )
-    POLICY_TRAINABLE_FILTER = policy_trainable_filter(policy, POLICY_CFG)
-    policy_trainable, _ = eqx.partition(policy, POLICY_TRAINABLE_FILTER)
-    policy_opt_state = policy_optimizer.init(policy_trainable)
+policy_optimizer = optax.chain(
+    optax.clip_by_global_norm(POLICY_CFG.grad_clip_norm),
+    optax.adamw(POLICY_CFG.learning_rate, weight_decay=POLICY_CFG.weight_decay),
+)
+policy_opt_state = policy_optimizer.init(eqx.filter(policy, eqx.is_array))
 
-    # Do not allocate Adam moments for the large Bayes Transport unless fine-tuning is requested.
-    # This materially reduces accelerator memory in the default frozen-inference setting.
-    if POLICY_CFG.finetune_bayes_transport:
-        bayes_optimizer = optax.chain(
-            optax.clip_by_global_norm(POLICY_CFG.bayes_finetune_grad_clip_norm),
-            optax.adamw(
-                POLICY_CFG.bayes_finetune_learning_rate,
-                weight_decay=POLICY_CFG.bayes_finetune_weight_decay,
-            ),
-        )
-        bayes_opt_state = bayes_optimizer.init(eqx.filter(bayes_model, eqx.is_array))
-    else:
-        bayes_optimizer = None
-        bayes_opt_state = None
+# Do not allocate Adam moments for the large Bayes Transport unless fine-tuning is requested.
+# This materially reduces accelerator memory in the default frozen-inference setting.
+if POLICY_CFG.finetune_bayes_transport:
+    bayes_optimizer = optax.chain(
+        optax.clip_by_global_norm(POLICY_CFG.bayes_finetune_grad_clip_norm),
+        optax.adamw(
+            POLICY_CFG.bayes_finetune_learning_rate,
+            weight_decay=POLICY_CFG.bayes_finetune_weight_decay,
+        ),
+    )
+    bayes_opt_state = bayes_optimizer.init(eqx.filter(bayes_model, eqx.is_array))
 else:
-    policy_optimizer = None
-    POLICY_TRAINABLE_FILTER = None
-    policy_opt_state = None
     bayes_optimizer = None
     bayes_opt_state = None
 
@@ -4583,24 +4210,17 @@ def policy_train_step(
     keys: Array,
     baseline_by_t: Array,
 ):
-    trainable_policy, frozen_policy = eqx.partition(
-        candidate_policy, POLICY_TRAINABLE_FILTER
+    (loss, aux), grads = eqx.filter_value_and_grad(policy_batch_objective, has_aux=True)(
+        candidate_policy, frozen_bayes, batch, keys, baseline_by_t, BT_CFG, POLICY_CFG
     )
-
-    def trainable_objective(candidate_trainable):
-        full_policy = eqx.combine(candidate_trainable, frozen_policy)
-        return policy_batch_objective(
-            full_policy, frozen_bayes, batch, keys, baseline_by_t, BT_CFG, POLICY_CFG
-        )
-
-    (loss, aux), grads = eqx.filter_value_and_grad(
-        trainable_objective, has_aux=True
-    )(trainable_policy)
-    updates, candidate_opt_state = policy_optimizer.update(
-        grads, candidate_opt_state, trainable_policy
+    params = eqx.filter(candidate_policy, eqx.is_array)
+    updates, candidate_opt_state = policy_optimizer.update(grads, candidate_opt_state, params)
+    updated_policy = eqx.apply_updates(candidate_policy, updates)
+    # Reused Bayes components are frozen under the policy loss by default. Restore them exactly
+    # after AdamW so only the acquisition/policy-specific parameters move.
+    updated_policy = restore_frozen_policy_components(
+        updated_policy, candidate_policy, POLICY_CFG
     )
-    trainable_policy = eqx.apply_updates(trainable_policy, updates)
-    updated_policy = eqx.combine(trainable_policy, frozen_policy)
     grad_norm = optax.global_norm(eqx.filter(grads, eqx.is_array))
     return updated_policy, candidate_opt_state, loss, aux, grad_norm
 
@@ -4626,29 +4246,29 @@ def bayes_finetune_step(
 
 
 #%% 17) Initial learned-vs-random diagnostic before policy training
-if POLICY_CFG.train_policy:
-    initial_eval = evaluate_policy_pair(
-        policy, bayes_model, eval_batch_np, jax.random.key(POLICY_CFG.seed + 40_000), BT_CFG, POLICY_CFG
-    )
-    initial_rows = evaluation_summary_rows(initial_eval, POLICY_CFG)
-    save_evaluation_table(initial_rows, policy_run_dir / "tables", "comparison_epoch_000000")
-    plot_policy_vs_random_metrics(
-        initial_eval, policy_run_dir / "plots" / "policy_vs_random_epoch_000000.png", POLICY_CFG
-    )
-    fixed_learned, fixed_random = fixed_policy_pair_rollout(
-        policy, bayes_model, fixed_reference, BT_CFG, POLICY_CFG
-    )
-    plot_fixed_policy_evolution(
-        fixed_learned, fixed_reference["theta_true"], fixed_reference["prior_particles"],
-        int(fixed_reference["num_sources"]), int(fixed_reference["theta_size"]), BT_CFG, POLICY_CFG,
-        policy_run_dir / "plots" / "fixed_trajectory_epoch_000000.png",
-        "Strategic-policy posterior evolution before policy training",
-    )
-    plot_fixed_policy_vs_random(
-        fixed_learned, fixed_random, fixed_reference["theta_true"], fixed_reference["prior_particles"],
-        int(fixed_reference["num_sources"]), int(fixed_reference["theta_size"]), BT_CFG, POLICY_CFG,
-        policy_run_dir / "plots" / "fixed_trajectory_policy_vs_random_epoch_000000.png",
-    )
+initial_eval = evaluate_policy_pair(
+    policy, bayes_model, eval_batch_np, jax.random.key(POLICY_CFG.seed + 40_000), BT_CFG, POLICY_CFG
+)
+initial_rows = evaluation_summary_rows(initial_eval, POLICY_CFG)
+save_evaluation_table(initial_rows, policy_run_dir / "tables", "comparison_epoch_000000")
+plot_policy_vs_random_metrics(
+    initial_eval, policy_run_dir / "plots" / "policy_vs_random_epoch_000000.png", POLICY_CFG
+)
+fixed_learned, fixed_random = fixed_policy_pair_rollout(
+    policy, bayes_model, fixed_reference, BT_CFG, POLICY_CFG
+)
+plot_fixed_policy_evolution(
+    fixed_learned, fixed_reference["theta_true"], fixed_reference["prior_particles"],
+    int(fixed_reference["num_sources"]), int(fixed_reference["theta_size"]), BT_CFG, POLICY_CFG,
+    policy_run_dir / "plots" / "fixed_trajectory_epoch_000000.png",
+    "Strategic-policy posterior evolution before policy training",
+)
+plot_fixed_policy_vs_random(
+    fixed_learned, fixed_random, fixed_reference["theta_true"], fixed_reference["prior_particles"],
+    int(fixed_reference["num_sources"]), int(fixed_reference["theta_size"]), BT_CFG, POLICY_CFG,
+    policy_run_dir / "plots" / "fixed_trajectory_policy_vs_random_epoch_000000.png",
+)
+
 
 #%% 18) Train the Bayesian experimental-design policy
 # Every optimizer update below uses a newly simulated batch.  The nested epoch structure is purely
@@ -4826,9 +4446,8 @@ if POLICY_CFG.train_policy:
                 reinforce_baseline_by_t=np.asarray(baseline_by_t),
             )
 else:
-    # Reload a policy checkpoint using the skeleton built from this archived training script.  Only
-    # evaluation-only hyperparameters (trajectory counts, deterministic/stochastic evaluation, EIG
-    # contrastives, confidence level and plotting controls) should be changed for post-training use.
+    # Reload a policy checkpoint using a skeleton built from THIS PolicyConfig and the recovered
+    # Bayes architecture.  Edit PolicyConfig to match the run you are reloading.
     artifact_dir = policy_run_dir / "artefacts"
     candidates = (
         [artifact_dir / "policy_last.eqx"]
@@ -4840,59 +4459,31 @@ else:
         raise FileNotFoundError(f"No policy checkpoint found in {artifact_dir}.")
     policy = eqx.tree_deserialise_leaves(checkpoint, policy)
     print("Reloaded policy:", checkpoint)
-
-    # If this run fine-tuned Bayes Transport, the saved fine-tuned inference checkpoint is part of
-    # the trained system and must be restored for faithful learned-vs-random evaluation. Presence of
-    # the run-local checkpoint is authoritative; evaluation settings never trigger new fine-tuning.
     ft_path = artifact_dir / "bayes_transport_finetuned_last.eqx"
-    if ft_path.is_file():
+    if POLICY_CFG.finetune_bayes_transport and ft_path.is_file():
         bayes_model = eqx.tree_deserialise_leaves(ft_path, bayes_model)
         policy = sync_reused_policy_components_from_bayes(policy, bayes_model, POLICY_CFG)
         print("Reloaded fine-tuned Bayes Transport and synchronized reused policy components:", ft_path)
-
     history_path = artifact_dir / "training_history.npz"
     if history_path.is_file():
         loaded = dict(np.load(history_path, allow_pickle=False))
         history = {name: list(value) for name, value in loaded.items() if name != "reinforce_baseline_by_t"}
-        print("Reloaded training history:", history_path)
-    else:
-        print("WARNING: training_history.npz was not found; training-loss plots cannot be recreated.")
-
-
-# Evaluation-only reruns write to a separate subdirectory so the original training diagnostics,
-# tables and fixed-trajectory artefacts remain untouched while evaluation hyperparameters are varied.
-if POLICY_CFG.train_policy:
-    final_plots_dir = policy_run_dir / "plots"
-    final_tables_dir = policy_run_dir / "tables"
-    final_artefacts_dir = policy_run_dir / "artefacts"
-else:
-    analysis_root = (
-        policy_run_dir
-        / POLICY_CFG.evaluation_output_subdir
-        / f"seed_{EVAL_SEED}"
-    )
-    final_plots_dir = analysis_root / "plots"
-    final_tables_dir = analysis_root / "tables"
-    final_artefacts_dir = analysis_root / "artefacts"
-    for directory in (final_plots_dir, final_tables_dir, final_artefacts_dir):
-        directory.mkdir(parents=True, exist_ok=True)
-    print("Evaluation-only outputs:", analysis_root)
 
 
 #%% 19) Final evaluation, comparison table, and paper-style metric plots
 final_eval = evaluate_policy_pair(
     policy, bayes_model, eval_batch_np,
-    jax.random.key(EVAL_SEED + 80_000), BT_CFG, POLICY_CFG,
+    jax.random.key(POLICY_CFG.seed + 80_000), BT_CFG, POLICY_CFG,
 )
 final_rows = evaluation_summary_rows(final_eval, POLICY_CFG)
-save_evaluation_table(final_rows, final_tables_dir, "comparison_final")
+save_evaluation_table(final_rows, policy_run_dir / "tables", "comparison_final")
 final_eig_rows = eig_final_summary_rows(final_eval, POLICY_CFG)
-save_evaluation_table(final_eig_rows, final_tables_dir, "eig_final")
+save_evaluation_table(final_eig_rows, policy_run_dir / "tables", "eig_final")
 plot_eig_final(
-    final_eval, final_plots_dir / "eig_final.png", POLICY_CFG
+    final_eval, policy_run_dir / "plots" / "eig_final.png", POLICY_CFG
 )
 plot_policy_vs_random_metrics(
-    final_eval, final_plots_dir / "policy_vs_random_final.png", POLICY_CFG
+    final_eval, policy_run_dir / "plots" / "policy_vs_random_final.png", POLICY_CFG
 )
 
 fixed_learned, fixed_random = fixed_policy_pair_rollout(
@@ -4901,25 +4492,25 @@ fixed_learned, fixed_random = fixed_policy_pair_rollout(
 plot_fixed_policy_evolution(
     fixed_learned, fixed_reference["theta_true"], fixed_reference["prior_particles"],
     int(fixed_reference["num_sources"]), int(fixed_reference["theta_size"]), BT_CFG, POLICY_CFG,
-    final_plots_dir / "fixed_trajectory_best_policy.png",
+    policy_run_dir / "plots" / "fixed_trajectory_best_policy.png",
     "Best/latest strategic-policy posterior evolution",
 )
 plot_fixed_policy_vs_random(
     fixed_learned, fixed_random, fixed_reference["theta_true"], fixed_reference["prior_particles"],
     int(fixed_reference["num_sources"]), int(fixed_reference["theta_size"]), BT_CFG, POLICY_CFG,
-    final_plots_dir / "fixed_trajectory_policy_vs_random_final.png",
+    policy_run_dir / "plots" / "fixed_trajectory_policy_vs_random_final.png",
 )
 plot_design_field_comparison(
     fixed_learned, fixed_random, fixed_reference["theta_true"],
     int(fixed_reference["num_sources"]), int(fixed_reference["theta_size"]), BT_CFG, POLICY_CFG,
-    final_plots_dir / "fixed_design_field_final.png",
+    policy_run_dir / "plots" / "fixed_design_field_final.png",
 )
 if "history" in globals():
-    plot_training_diagnostics(history, final_plots_dir / "training_diagnostics.png")
+    plot_training_diagnostics(history, policy_run_dir / "plots" / "training_diagnostics.png")
 
 # Save the final fixed trajectory arrays so every policy plot/table is reproducible without rerunning.
 np.savez_compressed(
-    final_artefacts_dir / "fixed_policy_vs_random_trajectory.npz",
+    policy_run_dir / "artefacts" / "fixed_policy_vs_random_trajectory.npz",
     theta_true=fixed_reference["theta_true"],
     prior_particles=fixed_reference["prior_particles"],
     observation_noise=fixed_reference["observation_noise"],
@@ -4939,13 +4530,12 @@ summary = {
     "bayes_checkpoint": str(BAYES_CHECKPOINT),
     "bayes_source_script": None if BAYES_SOURCE_SCRIPT is None else str(BAYES_SOURCE_SCRIPT),
     "policy_config": asdict(POLICY_CFG),
-        "evaluation_seed": int(EVAL_SEED),
     "bayes_transport_recovered_config": asdict(BT_CFG),
     "final_comparison": final_rows,
     "final_eig_table": final_eig_rows,
     "notes": {
         "reward": "consecutive empirical-cloud improvement; attraction-only or full energy score",
-        "pathwise": "reparameterized Tanh-Gaussian design + Gaussian likelihood + differentiable frozen Bayes map",
+        "pathwise": "straight-through Gumbel-Softmax discrete design + Gaussian likelihood + differentiable frozen Bayes map",
         "reinforce": "detached environment trajectory + score-function log probability; optional EMA baseline",
         "eig_metric": "sequential Prior Contrastive Estimation lower bound (sPCE), reported in nats",
         "experimental_budget": "number of sequential policy decisions per episode; defaults to 30",
@@ -4953,7 +4543,7 @@ summary = {
         "fixed_visualisation": "fresh policy-specific theta*, initial cloud, random baseline, and Gaussian-noise realization are generated once per policy run and reused unchanged throughout training; the original Bayes fixed trajectory is provenance only",
     },
 }
-save_json(final_artefacts_dir / "final_summary.json", summary)
+save_json(policy_run_dir / "artefacts" / "final_summary.json", summary)
 
 print("\nFinal strategic-vs-random comparison")
 for row in final_rows:
@@ -4964,4 +4554,4 @@ for row in final_eig_rows:
         f"{row['method']}: {row['mean_sPCE_EIG_nats']:.4f} ± "
         f"{row['ci95_halfwidth_nats']:.4f} nats"
     )
-print("Policy outputs saved to:", policy_run_dir if POLICY_CFG.train_policy else analysis_root)
+print("Policy outputs saved to:", policy_run_dir)
