@@ -15,3 +15,4 @@ reinforce/cartpole_out/
 
 *.log
 distrib-transform/bayes-sim/nohup.log
+reinforce/outs
