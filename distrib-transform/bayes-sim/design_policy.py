@@ -139,7 +139,7 @@ class PolicyConfig:
     # K outcomes are passed to that Bayes map JOINTLY as one K-observation prefix.  Thus K is also
     # the observation count used by the pretrained map at each policy decision.
     # The BED benchmark default is deliberately 30 sequential decisions.
-    experimental_budget: int = 16
+    experimental_budget: int = 30
     designs_per_step: int = 1            # K designs proposed JOINTLY at each policy decision.
     num_particles: int = 32              # empirical belief-cloud size seen by the policy.
     # True: C_t is recomputed from the episode base prior plus the full observed history.
@@ -158,10 +158,10 @@ class PolicyConfig:
     #     normalized physical theta and (design,outcome) values into embedding_dim.
     #   * otherwise this is a heterogeneous/dimension-agnostic policy, for which the pretrained
     #     Bayes embedders can be reused (or fresh same-architecture copies can be trained).
-    min_num_sources: int = 2
-    max_num_sources: int = 2
-    min_source_dim: int = 2
-    max_source_dim: int = 2
+    min_num_sources: int = 1
+    max_num_sources: int = 6
+    min_source_dim: int = 1
+    max_source_dim: int = 6
 
     # Held-out (S,D) combinations, following the original codebase convention. The active default
     # there was empty, so the default here is also empty. Example ablations from the old script were
@@ -231,18 +231,19 @@ class PolicyConfig:
     design_set_diversity_scale: float = 0.40
 
     # Gradient estimator and reward.
-    gradient_estimator: str = "reinforce"   # {"pathwise", "reinforce"}
+    gradient_estimator: str = "pathwise"   # {"pathwise", "reinforce"}
     # Posterior loss/score used by the reward.  All modes work with all reward references below.
     # "particle_max_mse" is the worst per-particle MSE; "mean_log_mse" is the mean across particles
-    # of log(per-particle MSE + eps).  Posterior-mean and robust particle alternatives are included too.
-    reward_mode: str = "mean_log_mse"      # {"energy_score", "attraction", "posterior_mean_mse",
+    # of log(per-particle MSE + eps).  "mse_plus_log_mse" adds particle MSE and its log-MSE term.
+    # Posterior-mean and robust particle alternatives are included too.
+    reward_mode: str = "mse_plus_log_mse"      # {"energy_score", "attraction", "posterior_mean_mse",
                                           #  "posterior_mean_rmse", "particle_mean_mse",
                                           #  "particle_max_mse", "particle_median_mse",
-                                          #  "mean_log_mse", "log_mean_mse"}
+                                          #  "mean_log_mse", "log_mean_mse", "mse_plus_log_mse"}
     # "initial":  r_t = loss(C_0) - loss(C_t), giving every posterior prefix direct reward signal.
     # "previous": r_t = loss(C_{t-1}) - loss(C_t), retaining the original one-step improvement.
     # "terminal": r_t = 0 for t<T and r_T = -loss(C_T): only the final posterior defines the reward.
-    reward_reference: str = "initial"      # {"initial", "previous", "terminal"}
+    reward_reference: str = "initial"      # {"previous", "initial", "terminal"}
     discount_gamma: float = 1.0
     reward_scale: float = 1.0
     reward_clip: float | None = None
@@ -270,9 +271,9 @@ class PolicyConfig:
     # Optimisation.  Training is explicitly organised into epochs even though EVERY optimizer
     # step draws a completely fresh simulator batch.  Thus an epoch is a bookkeeping/diagnostic
     # unit rather than a pass over a finite dataset.  The defaults retain 50,000 optimizer updates.
-    epochs: int = 250*1
+    epochs: int = 500*7
     train_steps_per_epoch: int = 128
-    batch_size: int = 16*4*1
+    batch_size: int = 16//1
     learning_rate: float = 1e-5
     weight_decay: float = 1e-6
     grad_clip_norm: float = 10.0
@@ -281,9 +282,9 @@ class PolicyConfig:
     # optimizer steps per epoch these correspond to the old 1k/5k/1k step cadences.
     # When train_policy=False, the evaluation-only knobs below may be changed freely without
     # retraining or changing the saved policy architecture.
-    eval_every_epochs: int = 10
-    save_every_epochs: int = 50
-    plot_every_epochs: int = 10
+    eval_every_epochs: int = 100
+    save_every_epochs: int = 500
+    plot_every_epochs: int = 100
     n_eval_trajectories: int = 128
     eval_deterministic_policy: bool = True
     # Number of independent prior contrastives used for the sPCE/EIG lower-bound diagnostic.
@@ -385,6 +386,7 @@ def validate_policy_config(cfg: PolicyConfig):
         "particle_median_mse",
         "mean_log_mse",
         "log_mean_mse",
+        "mse_plus_log_mse",
     }
     if cfg.reward_mode not in supported_reward_modes:
         raise ValueError(
@@ -531,8 +533,15 @@ def discover_bayes_transport_source(cfg: PolicyConfig) -> Path | None:
             seen_roots.add(root)
             unique_roots.append(root)
 
-    candidates: list[Path] = []
+    # Search roots are already ordered from most specific to least specific: the current
+    # Bayes run directory first, then an explicit policy reload directory / archived policy
+    # location and their ancestors.  Respect that ordering.  The previous implementation
+    # collected candidates from *all* roots and then preferred the shortest filesystem path,
+    # which could incorrectly select a project-level bayes-transport.py instead of the exact
+    # run-local copy that created the checkpoint.  That reconstructs the wrong Equinox tree and
+    # shifts the serialized leaf stream (often surfacing later as an unrelated dropout.p error).
     for root in unique_roots:
+        root_candidates: list[Path] = []
         for path in sorted(root.glob("*.py")):
             if this_file is not None and path.resolve() == this_file:
                 continue
@@ -547,20 +556,20 @@ def discover_bayes_transport_source(cfg: PolicyConfig) -> Path | None:
                 and "class SequentialBayesModel" in prefix
                 and "class PolicyConfig" not in prefix
             ):
-                candidates.append(path)
+                root_candidates.append(path.resolve())
 
-    if not candidates:
-        return None
-    # Prefer filenames that look like the archived training script, then the closest discovered path.
-    candidates.sort(
-        key=lambda p: (
-            "bayes" not in p.name.lower(),
-            "transport" not in p.name.lower(),
-            len(p.parts),
-            p.name,
-        )
-    )
-    return candidates[0]
+        if root_candidates:
+            # Within the nearest directory only, prefer a conventional Bayes-Transport filename.
+            root_candidates.sort(
+                key=lambda p: (
+                    "bayes" not in p.name.lower(),
+                    "transport" not in p.name.lower(),
+                    p.name,
+                )
+            )
+            return root_candidates[0]
+
+    return None
 
 
 def recover_bayes_transport_config(cfg: PolicyConfig) -> tuple[BayesTransportConfig, Path | None]:
@@ -578,9 +587,9 @@ def recover_bayes_transport_config(cfg: PolicyConfig) -> tuple[BayesTransportCon
 
 
 BT_CFG, BAYES_SOURCE_SCRIPT = recover_bayes_transport_config(POLICY_CFG)
-BT_CFG = replace(
-    BT_CFG, canonicalize_particle_sources=bool(POLICY_CFG.canonicalize_inputs_by_norm)
-)
+# IMPORTANT: BT_CFG describes the PRETRAINED Bayes checkpoint and must remain intact.
+# Policy-side canonicalisation/shape choices are downstream choices; they must never rewrite
+# the architecture or static semantics used to reconstruct the Bayes model.
 
 
 def validate_bayes_compatibility_config(cfg: BayesTransportConfig):
@@ -2090,15 +2099,143 @@ def find_bayes_checkpoint(cfg: PolicyConfig) -> Path:
     )
 
 
-def load_bayes_model(path: str | Path, cfg: BayesTransportConfig) -> SequentialBayesModel:
-    skeleton = SequentialBayesModel(cfg, key=jax.random.key(0))
+def _serialisable_leaf_layout(tree: Any) -> list[tuple[str, tuple[int, ...], str]]:
+    """Return the exact np.save record layout Equinox expects for this PyTree.
+
+    Equinox serialises JAX/NumPy arrays and Python numeric scalars in deterministic
+    depth-first PyTree order.  Static fields are absent from this list.  Comparing this
+    layout with the concatenated .npy records in an .eqx file lets us distinguish a
+    genuine checkpoint/tree mismatch from an innocent 2x2 downstream policy choice.
+    """
+    leaves_with_path, _ = jax.tree_util.tree_flatten_with_path(tree)
+    layout: list[tuple[str, tuple[int, ...], str]] = []
+    scalar_types = (bool, int, float, complex, np.generic)
+    for path, leaf in leaves_with_path:
+        key = jax.tree_util.keystr(path)
+        if isinstance(leaf, (jax.Array, np.ndarray, jax.ShapeDtypeStruct)):
+            layout.append((key, tuple(leaf.shape), str(leaf.dtype)))
+        elif isinstance(leaf, scalar_types):
+            arr = np.asarray(leaf)
+            layout.append((key, tuple(arr.shape), str(arr.dtype)))
+    return layout
+
+
+def _checkpoint_record_layout(path: str | Path) -> list[tuple[tuple[int, ...], str]]:
+    """Read the concatenated NumPy records written by eqx.tree_serialise_leaves."""
+    checkpoint = Path(path)
+    records: list[tuple[tuple[int, ...], str]] = []
+    size = checkpoint.stat().st_size
+    with checkpoint.open("rb") as handle:
+        while handle.tell() < size:
+            offset = handle.tell()
+            try:
+                value = np.load(handle, allow_pickle=False)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Could not parse Equinox checkpoint record at byte offset {offset} "
+                    f"of {checkpoint}. The file may be truncated/corrupt."
+                ) from exc
+            value = np.asarray(value)
+            records.append((tuple(value.shape), str(value.dtype)))
+    return records
+
+
+def _checkpoint_layout_mismatch(
+    path: str | Path, skeleton: SequentialBayesModel
+) -> tuple[bool, str]:
+    expected = _serialisable_leaf_layout(skeleton)
+    actual = _checkpoint_record_layout(path)
+    n = min(len(expected), len(actual))
+    for i in range(n):
+        key, expected_shape, expected_dtype = expected[i]
+        actual_shape, actual_dtype = actual[i]
+        if expected_shape != actual_shape:
+            return False, (
+                f"record {i}: skeleton {key} expects shape {expected_shape} "
+                f"({expected_dtype}), checkpoint contains shape {actual_shape} ({actual_dtype})"
+            )
+    if len(expected) != len(actual):
+        return False, (
+            f"record-count mismatch: skeleton expects {len(expected)} serialised leaves, "
+            f"checkpoint contains {len(actual)}"
+        )
+    return True, f"exact record layout match ({len(expected)} serialised leaves)"
+
+
+def load_bayes_model(
+    path: str | Path, cfg: BayesTransportConfig
+) -> tuple[SequentialBayesModel, BayesTransportConfig]:
+    """Load the FULL pretrained Bayes model and return its checkpoint-resolved config.
+
+    The downstream policy may train only on 2x2 tasks, but that must not change the
+    Bayes skeleton: heterogeneous embedders, likelihood Transformer and posterior
+    Transformer are reconstructed at their original pretrained capacities.
+
+    If the archived source and checkpoint disagree only on the posterior-conditioning
+    branch, test both supported branches against the raw Equinox record layout.  We
+    accept an alternative only when its complete serialised leaf layout matches the
+    checkpoint exactly; there is no heuristic parameter surgery.
+    """
+    checkpoint = Path(path)
+    config_candidates = [cfg]
+    alternate_conditioning = "adaln" if cfg.posterior_conditioning == "cross_attention" else "cross_attention"
+    config_candidates.append(replace(cfg, posterior_conditioning=alternate_conditioning))
+
+    diagnostics: list[str] = []
+    matching: list[tuple[BayesTransportConfig, SequentialBayesModel]] = []
+    for candidate in config_candidates:
+        skeleton = SequentialBayesModel(candidate, key=jax.random.key(0))
+        try:
+            matches, detail = _checkpoint_layout_mismatch(checkpoint, skeleton)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not inspect Bayes-Transport checkpoint layout: {checkpoint}"
+            ) from exc
+        diagnostics.append(f"posterior_conditioning={candidate.posterior_conditioning}: {detail}")
+        if matches:
+            matching.append((candidate, skeleton))
+
+    if len(matching) == 0:
+        raise RuntimeError(
+            "The Bayes checkpoint does not have the Equinox leaf layout of either posterior "
+            "architecture reconstructed from the archived source. This is NOT caused by the "
+            "2x2 policy restriction; loading occurs before the policy is built. Most likely the "
+            "checkpoint was written by a different revision of the Bayes model/library tree, or "
+            "the checkpoint is damaged. Layout diagnostics:\n  - "
+            + "\n  - ".join(diagnostics)
+            + f"\nCheckpoint: {checkpoint}; archived source: {BAYES_SOURCE_SCRIPT}; "
+              f"recovered config: {asdict(cfg)}"
+        )
+    if len(matching) > 1:
+        raise RuntimeError(
+            "Ambiguous Bayes checkpoint layout: both posterior branches appear compatible, "
+            "which should not occur. Diagnostics:\n  - " + "\n  - ".join(diagnostics)
+        )
+
+    resolved_cfg, skeleton = matching[0]
+    resolved_detail = next(
+        detail for detail in diagnostics
+        if detail.startswith(f"posterior_conditioning={resolved_cfg.posterior_conditioning}:")
+    )
+    print("Bayes checkpoint layout:", resolved_detail)
+    if resolved_cfg.posterior_conditioning != cfg.posterior_conditioning:
+        print(
+            "WARNING: archived Bayes source says posterior_conditioning="
+            f"{cfg.posterior_conditioning!r}, but the checkpoint leaf layout matches "
+            f"{resolved_cfg.posterior_conditioning!r} exactly. Using the checkpoint-resolved "
+            "posterior architecture so the saved Bayes model is loaded intact."
+        )
     try:
-        return eqx.tree_deserialise_leaves(Path(path), skeleton)
+        model = eqx.tree_deserialise_leaves(checkpoint, skeleton)
     except Exception as exc:
         raise RuntimeError(
-            "Could not deserialize the Bayes-Transport checkpoint with the recovered architecture. "
-            f"Checkpoint: {path}; archived source: {BAYES_SOURCE_SCRIPT}; recovered config: {asdict(cfg)}"
+            "Checkpoint leaf layout matches the reconstructed Bayes skeleton, but Equinox still "
+            "failed to deserialize it. This points to a package-version/type compatibility issue "
+            "rather than a policy-shape issue. "
+            f"JAX={jax.__version__}; Equinox={getattr(eqx, '__version__', 'unknown')}; "
+            f"Checkpoint: {checkpoint}; resolved Bayes config: {asdict(resolved_cfg)}"
         ) from exc
+    return model, resolved_cfg
 
 
 #%% 6) Policy Transformer: cloud/history cross-attention followed by a set-valued design decoder
@@ -2966,6 +3103,7 @@ def cloud_metrics_jax(
         "particle_median_mse": jnp.median(particle_mse),
         "mean_log_mse": jnp.mean(jnp.log(particle_mse + 1e-12)),
         "log_mean_mse": jnp.log(particle_mean_mse + 1e-12),
+        "mse_plus_log_mse": particle_mean_mse + jnp.mean(jnp.log(particle_mse + 1e-12)),
         "spread": posterior_spread_single(compact_cloud, theta_size),
     }
 
@@ -4459,7 +4597,8 @@ if joint_aline_mode(POLICY_CFG):
 print("Archived Bayes-Transport source:", BAYES_SOURCE_SCRIPT)
 
 BAYES_CHECKPOINT = find_bayes_checkpoint(POLICY_CFG)
-bayes_model = load_bayes_model(BAYES_CHECKPOINT, BT_CFG)
+bayes_model, BT_CFG = load_bayes_model(BAYES_CHECKPOINT, BT_CFG)
+print("Checkpoint-resolved Bayes-Transport configuration:\n", yaml.safe_dump(asdict(BT_CFG), sort_keys=False))
 print("Loaded Bayes Transport:", BAYES_CHECKPOINT)
 print(f"Bayes Transport parameters: {count_parameters(bayes_model):,}")
 
